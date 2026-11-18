@@ -129,7 +129,7 @@ for (const dataset of ['XOR', 'Three-Class', 'Plane']) {
         await expect(page.getByRole('region', { name: 'Loss landscape probe', exact: true })).toContainText('Probe from step 1');
         await expect(page.getByRole('region', { name: 'Loss landscape probe', exact: true }).getByRole('img')).toBeVisible();
         expect(await identity(page)).toEqual(before);
-        await transport(page).getByRole('button', { name: /(?:Start|Resume) training/, exact: true }).click();
+        await transport(page).getByRole('button', { name: 'Play training', exact: true }).click();
         await expect(page.locator('.inspection__pause').getByRole('button', { name: 'Pause training', exact: true })).toBeVisible();
         await expect(page.getByRole('button', { name: 'Preview backprop', exact: true })).toBeDisabled();
         await page.locator('.inspection__pause').getByRole('button', { name: 'Pause training', exact: true }).click();

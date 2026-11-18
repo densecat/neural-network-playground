@@ -64,8 +64,8 @@ function errorMessage(error: unknown): string {
 
 /**
  * Runs one canonical recipe edit as an owned training-config transaction.
- * Returns this request's exact prepared object only while it is the current
- * store publication. Stale completions never clear or overwrite newer state.
+ * Returns the current prepared document while it belongs to this request.
+ * A display edit can update its view without superseding the recipe.
  */
 export async function commitRecipeEditPrepared(
     source: RecipeConfigChangeSource,
@@ -99,7 +99,9 @@ export async function commitRecipeEditPrepared(
             return null;
         }
         return playground.access.status === 'ready'
-            && playground.access.prepared === result.value ? result.value : null;
+            && playground.access.prepared.identities === result.value.identities
+            ? playground.access.prepared
+            : null;
     } catch (error) {
         if (transactionId === latestRecipeEditTransaction
             && usePlaygroundStore.getState().preparation.requestId === requestId) {

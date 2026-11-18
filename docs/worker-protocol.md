@@ -50,12 +50,13 @@ through the MessageChannel commands below.
 |---|---|---|
 | `initialize(network, training, data, features)` | `{ snapshot, runId }` | Normalizes and validates config, rebuilds data/network, allocates fresh transport state. |
 | `updateConfig(network, training, data, features, rebuild)` | `{ snapshot, runId }` | Normalizes and validates config; rebuilds only when required or requested. |
-| `step(iterations = 1)` | `NetworkSnapshot` | Synchronous manual stepping for UI "step" actions/tests. |
+| `step(iterations = 1)` | `NetworkSnapshot` | Legacy synchronous stepping. |
+| `stepExperimentV2(iterations = 1, visuals = 'cadence')` | `Promise<WorkerExperimentResultV2>` | The Step button requests `'current'` to publish visible plots for the same model as the full evaluation. Other callers can use the configured plot cadence. |
 | `reset()` | `{ snapshot, runId }` | Stops streaming, rebuilds data/network, returns a fresh snapshot. |
-| `getCheckpointTimeline()` | `CheckpointTimeline` | Returns lightweight runtime-only checkpoint summaries. Heavy checkpoint payloads stay inside the worker. |
-| `restoreCheckpoint(id)` | `{ snapshot, runId, timeline }` | Stops streaming, restores a bounded runtime checkpoint, invalidates stale visualizations, and returns a fresh snapshot plus timeline metadata. |
-| `getTrainPoints()` | `DataPoint[]` | Returns current transformed training points for immediate UI render after init/config/reset. |
-| `getTestPoints()` | `DataPoint[]` | Returns current transformed test points for immediate UI render after init/config/reset. |
+| `captureCheckpointV2(request)` | `WorkerExperimentResultV2` | Captures the current model and paired evaluation in the worker and returns lightweight timeline metadata. |
+| `restoreCheckpointV2(request)` | `WorkerExperimentResultV2` | Stops streaming and applies a checkpoint in the current generation. |
+| `branchCheckpointV2(request)` | `WorkerExperimentResultV2` | Keeps the previous live model as a checkpoint and applies a reproducible checkpoint in the current generation. An optional `trainingSteps` budget limits subsequent optimizer updates. |
+| `getDatasetPointsV2(runId, datasetKey)` | `WorkerDatasetPointsV2` | Returns the matching run ID, dataset revision, and both point splits in one response. The worker rejects a request for another generation or dataset key. |
 | `getPredictionTrace(request)` | `PredictionTraceResponse` | One-shot point inspection for a train/test/custom sample. Returns bounded per-layer prediction trace metadata, not streamed frame-buffer data. |
 | `getBackpropExplanation()` | `BackpropExplanationResponse` | One-shot preview of the current mini-batch backprop update. Returns bounded scalar `BackpropExplanation` layer summaries only; it does not train, snapshot, stream, checkpoint, or expose raw activations/gradients. Throws at the epoch reshuffle boundary instead of mutating shuffle state. |
 | `getLossLandscapeProbe(options?)` | `LossLandscapeProbeResponse` | One-shot local loss-surface probe using the current worker model and transformed training data. Returns `runId`, `step`, `epoch`, and compact serializable metadata with at most a `7x7` grid and 64 samples. The worker converts engine `Float32Array` losses to a plain `number[]`; it does not train, snapshot, stream, checkpoint, touch frame buffers, or expose raw inputs, targets, weights, biases, checkpoints, gradients, or activations. |
@@ -241,17 +242,29 @@ Training checkpoints are runtime-only. Snapshot messages may include
 - `id`
 - `step`
 - `epoch`
-- `trainLoss`
-- `testLoss`
+- `trainDataLoss`
+- `testDataLoss`
 - optional train/test accuracy
+- `trajectoryGuarantee` for versioned checkpoints
 - display `label`
 
 The metadata also includes `maxCheckpoints`, `evictedCount`,
-`liveCheckpointId`, and `restoredCheckpointId`. This data is safe for React
-state because it contains only bounded scalar summaries. Model weights, biases,
-optimizer buffers, decision-boundary grids, activation arrays, and other heavy
-payloads are not stored in React state and are not persisted in URL/config or
-run-history schemas.
+`liveCheckpointId`, and `restoredCheckpointId`. An active `branch` references
+the source and previous live checkpoints and can include a `targetStep`.
+The worker retains both referenced checkpoints within the bounded timeline
+while the branch is active. At the target step, both Play and Step publish
+the final evaluation and requested plots and retain one endpoint checkpoint.
+Restoring the previous model leaves that endpoint available in the timeline.
+Checkpoint payloads stay inside the worker for the duration of the session.
+
+Checkpoint schema version 3 saves the shuffled indices, next batch offset,
+and shuffle generator state alongside the model parameters and optimizer.
+The restored model step also resumes the recipe’s learning-rate schedule.
+This reproduces the sequence of batches and parameter updates under the same
+recipe, including across epoch boundaries. Live loss trends, evaluation
+history, and automatic-stop tracking start a new segment. Schema version 2
+continues to support parameter and optimizer restoration with its original
+limited trajectory guarantee.
 
 ### `updateSpeed`
 

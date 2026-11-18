@@ -2,9 +2,11 @@ import { runInNewContext } from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
 import {
     SESSION_CHECKPOINT_MAX_TYPED_ARRAY_BYTES,
+    validateSessionCheckpoint,
     validateSessionCheckpointV2,
     type DatasetRevision,
     type SessionCheckpointV2,
+    type SessionCheckpointV3,
     type SessionCheckpointValidationContext,
 } from '../index.js';
 
@@ -108,6 +110,43 @@ function checkpoint(): SessionCheckpointV2 {
 function cloneCheckpoint(source: SessionCheckpointV2 = checkpoint()): SessionCheckpointV2 {
     return structuredClone(source);
 }
+
+describe('validateSessionCheckpoint', () => {
+    const reproducible = (shufflePrngState: number): SessionCheckpointV3 => {
+        const legacy = checkpoint();
+        return {
+            ...legacy,
+            schemaVersion: 3,
+            cursor: { ...legacy.cursor, shufflePrngState },
+            trajectoryGuarantee: 'same-recipe-training-trajectory',
+        };
+    };
+
+    it('preserves the version-specific trajectory guarantee and detaches cursor data', () => {
+        const legacy = checkpoint();
+        expect(validateSessionCheckpoint(legacy, context())).toEqual(legacy);
+
+        const source = reproducible(0xffff_ffff);
+        const parsed = validateSessionCheckpoint(source, context());
+        expect(parsed).toEqual(source);
+        expect(parsed.cursor.shuffledIndices).not.toBe(source.cursor.shuffledIndices);
+        expect(() => validateSessionCheckpointV2(source, context())).toThrow(/must equal 2/);
+    });
+
+    it.each([-1, 0x1_0000_0000, 0.5, Number.NaN])('rejects malformed shuffle state %s', (state) => {
+        expect(() => validateSessionCheckpoint(reproducible(state), context())).toThrow(/shufflePrngState/);
+    });
+
+    it('requires V3 shuffle state and rejects an upgraded V2 guarantee', () => {
+        const legacy = checkpoint();
+        expect(() => validateSessionCheckpoint({
+            ...reproducible(0), cursor: legacy.cursor,
+        }, context())).toThrow(/shufflePrngState/);
+        expect(() => validateSessionCheckpoint({
+            ...legacy, trajectoryGuarantee: 'same-recipe-training-trajectory',
+        }, context())).toThrow(/parameters-and-optimizer-only/);
+    });
+});
 
 describe('validateSessionCheckpointV2', () => {
     it('returns a fully detached clone that survives structuredClone round trips', () => {

@@ -34,6 +34,10 @@ function sourceLabel(source: Exclude<ConfigChangeSource, null>): string {
             return 'preset';
         case 'setup':
             return 'setup';
+        case 'saved-run':
+            return 'saved recipe';
+        case 'url':
+            return 'shared setup';
     }
 }
 

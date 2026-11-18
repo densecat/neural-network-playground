@@ -47,6 +47,7 @@ import { categoricalCrossEntropy, categoricalCrossEntropyLogitGradient, getLoss 
 import {
     applyGradientTransformInto,
     buildObjectiveBreakdown,
+    categoricalCrossEntropyWithLogits,
     computeGradientTransform,
     gradientNorm,
     validateObjectiveSpec,
@@ -60,52 +61,6 @@ import { NonFiniteNumericalError } from './numericalError.js';
 
 type NetworkActivationKind = ActivationType | 'softmax';
 type NetworkLossKind = LossType | 'categoricalCrossEntropy';
-const CATEGORICAL_TARGET_SUM_TOLERANCE = 1e-5;
-
-function categoricalCrossEntropyFromLogits(logits: ArrayLike<number>, target: ArrayLike<number>): number {
-    if (logits.length !== target.length) {
-        throw new RangeError('logits and target must have the same length');
-    }
-    if (logits.length === 0) {
-        throw new RangeError('categorical cross-entropy vectors must not be empty');
-    }
-
-    let maxLogit = -Infinity;
-    let targetSum = 0;
-    let targetLogitSum = 0;
-    for (let i = 0; i < logits.length; i++) {
-        const logit = logits[i];
-        const targetValue = target[i];
-        if (!Number.isFinite(logit)) {
-            throw new NonFiniteNumericalError(`logits[${i}]`, logit);
-        }
-        if (!Number.isFinite(targetValue)) {
-            throw new NonFiniteNumericalError(`target[${i}]`, targetValue);
-        }
-        if (targetValue < 0) {
-            throw new RangeError('target values must be finite and non-negative');
-        }
-        if (logit > maxLogit) maxLogit = logit;
-        targetSum += targetValue;
-        targetLogitSum += targetValue * logit;
-        assertFiniteValue(targetSum, 'target.sum');
-        assertFiniteValue(targetLogitSum, 'categoricalCrossEntropyFromLogits.targetLogitSum');
-    }
-
-    let expSum = 0;
-    for (let i = 0; i < logits.length; i++) {
-        expSum += Math.exp(logits[i] - maxLogit);
-        assertFiniteValue(expSum, 'categoricalCrossEntropyFromLogits.exponentialSum');
-    }
-    if (Math.abs(targetSum - 1) > CATEGORICAL_TARGET_SUM_TOLERANCE) {
-        throw new RangeError('target values must sum to 1');
-    }
-    const logNormalizer = maxLogit + Math.log(expSum);
-    assertFiniteValue(logNormalizer, 'categoricalCrossEntropyFromLogits.logNormalizer');
-    const result = targetSum * logNormalizer - targetLogitSum;
-    assertFiniteValue(result, 'categoricalCrossEntropyFromLogits.loss');
-    return result;
-}
 
 // ── Activation kernels ──────────────────────────────────────────────────────
 // Each kernel is monomorphic — V8 sees exactly one shape at each call site
@@ -1075,7 +1030,7 @@ export class Network {
         if (this.usesSoftmaxCategoricalLoss(lossType)) {
             const loss = logits == null
                 ? categoricalCrossEntropy(output, target)
-                : categoricalCrossEntropyFromLogits(logits, target);
+                : categoricalCrossEntropyWithLogits(logits, target);
             return { loss, count: 1 };
         }
 

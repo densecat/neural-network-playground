@@ -47,7 +47,10 @@ export const ConfigPanel = memo(function ConfigPanel(_props: ConfigPanelProps) {
     const errorGeneration = useRef(0);
     const [stage, setStage] = useState<{ document: ValidatedExperimentDocumentV2; name: string; baseRequestId: number } | null>(null);
     const [setupLink, setSetupLink] = useState<string | null>(null);
-    const target = useRef<PreparedExperimentDocumentV2 | null>(null);
+    const target = useRef<{
+        requestId: number;
+        identities: PreparedExperimentDocumentV2['identities'];
+    } | null>(null);
     const selection = useRef(0);
     const pending = useTrainingStore((state) => state.pendingConfigSource);
     const configError = useTrainingStore((state) => state.configError);
@@ -87,13 +90,17 @@ export const ConfigPanel = memo(function ConfigPanel(_props: ConfigPanelProps) {
             if (!expected) return;
             const ps = usePlaygroundStore.getState();
             const ts = useTrainingStore.getState();
-            if (ps.access.status !== 'ready' || ps.access.prepared !== expected || ps.preparation.status === 'preparing') {
+            const activeMatches = ps.access.status === 'ready' && ps.access.prepared.identities === expected.identities;
+            const rejectedMatches = ts.rejectedConfigRequest?.runRequestId === expected.requestId
+                && ts.rejectedConfigRequest.prepared.identities === expected.identities;
+            if (ps.access.status !== 'ready' || ps.runRequestId !== expected.requestId
+                || (!activeMatches && !rejectedMatches) || ps.preparation.status === 'preparing') {
                 target.current = null;
                 finishImport();
                 reportError('The active setup changed during import. Select the file again to review it.');
             } else if (ts.configError || ts.workerError) {
                 reportError(`${ts.configError ?? ts.workerError}. Retry synchronization to finish applying this setup.`);
-            } else if (ts.pendingConfigSource === null && ts.trainedRecipeSource === 'config-sync'
+            } else if (activeMatches && ts.pendingConfigSource === null && ts.trainedRecipeSource === 'config-sync'
                 && ts.trainedRecipeFingerprint === expected.identities.recipeFingerprint) {
                 target.current = null;
                 setStage(null);
@@ -244,8 +251,8 @@ export const ConfigPanel = memo(function ConfigPanel(_props: ConfigPanelProps) {
             }
             if (!mounted.current || selection.current !== token) return;
             const access = usePlaygroundStore.getState().access;
-            if (access.status !== 'ready' || access.prepared !== result.value) return;
-            target.current = result.value;
+            if (access.status !== 'ready' || access.prepared.identities !== result.value.identities) return;
+            target.current = { requestId, identities: result.value.identities };
             // The existing config transaction pauses and resets exactly once.
             // Success belongs only to the worker acknowledgement of this publication.
             const ts = useTrainingStore.getState();

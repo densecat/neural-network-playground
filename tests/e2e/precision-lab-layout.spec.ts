@@ -53,7 +53,7 @@ for (const theme of ['light', 'dark'] as const) {
         await page.getByLabel('Color theme').selectOption(theme);
         await workspace(page, 'Results');
         await page.getByLabel('Steps per frame').selectOption('50');
-        await page.getByRole('button', { name: 'Start training', exact: true }).click();
+        await page.getByRole('button', { name: 'Play training', exact: true }).click();
         await expect.poll(async () => Number(await transport(page).getAttribute('data-model-step'))).toBeGreaterThanOrEqual(1500);
         await expect.poll(async () => Number(await page.locator('.atelier-transport-position > div').nth(1).locator('strong').textContent())).toBeGreaterThanOrEqual(100);
         for (const width of [320, 360, 390]) {
@@ -127,14 +127,23 @@ for (const viewport of [{ width: 1440, height: 900 }, { width: 1024, height: 900
         const graphGeometry = await page.locator('.network-graph-frame').evaluate((frame) => {
             const plot = frame.querySelector('.network-graph-container')!.getBoundingClientRect();
             const legend = frame.querySelector('.network-graph-legend')!.getBoundingClientRect();
-            return { plot: plot.toJSON(), legend: legend.toJSON() };
+            const labels = [...frame.querySelectorAll('.network-graph-layer-labels > span')];
+            const surface = frame.querySelector('.network-graph-plot')!.getBoundingClientRect();
+            return {
+                plot: plot.toJSON(), legend: legend.toJSON(),
+                labelText: labels.map((label) => label.textContent),
+                labelBottom: Math.max(...labels.map((label) => label.getBoundingClientRect().bottom)),
+                surfaceTop: surface.top,
+            };
         });
+        expect(graphGeometry.labelText).toEqual(['Input', 'Hidden 1', 'Hidden 2', 'Output']);
+        expect(graphGeometry.labelBottom).toBeLessThanOrEqual(graphGeometry.surfaceTop + 1);
         expect(graphGeometry.legend.top, 'Legend stays outside the interactive graph').toBeGreaterThanOrEqual(graphGeometry.plot.bottom - 1);
         await page.evaluate(async () => { await document.fonts.ready; });
         await page.getByRole('combobox', { name: 'Steps per frame' }).selectOption('50');
         const regions = page.locator('.atelier-network, .atelier-metrics, .atelier-transport');
         const bounds = () => regions.evaluateAll((nodes) => nodes.map((node) => ({ name: node.className, rect: { ...node.getBoundingClientRect().toJSON(), y: node.getBoundingClientRect().y + window.scrollY } })));
-        await page.getByRole('button', { name: 'Start training', exact: true }).scrollIntoViewIfNeeded();
+        await page.getByRole('button', { name: 'Play training', exact: true }).scrollIntoViewIfNeeded();
         const before = await bounds();
         const overflowBefore = await horizontalOverflow(page);
         await page.evaluate(() => {
@@ -149,7 +158,7 @@ for (const viewport of [{ width: 1440, height: 900 }, { width: 1024, height: 900
                 }).observe({ type: 'layout-shift' });
             }
         });
-        await page.getByRole('button', { name: 'Start training', exact: true }).click();
+        await page.getByRole('button', { name: 'Play training', exact: true }).click();
         await expect(transport(page)).toHaveAttribute('data-status', 'running');
         await expect(page.getByRole('button', { name: 'Run one training step' })).toBeDisabled();
         await page.waitForTimeout(2500);

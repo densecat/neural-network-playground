@@ -1,4 +1,5 @@
 import { Buffer } from 'node:buffer';
+import process from 'node:process';
 import { expect, test, type Locator, type Page } from '@playwright/test';
 import { applyPreset, currentRun, expectEvidence, identity, learning, ready, transport, utility, workspace } from './atelier-helpers';
 
@@ -93,11 +94,27 @@ async function touchTarget(locator: Locator) {
     expect(box!.height).toBeGreaterThanOrEqual(44);
 }
 
+async function expectLinkedPanels(tablist: Locator, prefix: string, ids: string[], selected: string) {
+    await expect.poll(() => tablist.getByRole('tab').evaluateAll((tabs) => tabs.map((tab) => {
+        const controls = tab.getAttribute('aria-controls');
+        const panel = controls && document.getElementById(controls);
+        return {
+            tab: tab.id, controls, selected: tab.getAttribute('aria-selected'), tabIndex: (tab as HTMLElement).tabIndex,
+            role: panel ? panel.getAttribute('role') : null,
+            labelledBy: panel ? panel.getAttribute('aria-labelledby') : null,
+            hidden: panel instanceof HTMLElement ? panel.hidden : null,
+        };
+    }))).toEqual(ids.map((id) => ({
+        tab: `${prefix}-tab-${id}`, controls: `${prefix}-${id}`, selected: String(id === selected), tabIndex: id === selected ? 0 : -1,
+        role: 'tabpanel', labelledBy: `${prefix}-tab-${id}`, hidden: id !== selected,
+    })));
+}
+
 test('training can pause, single-step, preview and restore the initial checkpoint', async ({ page }) => {
     await load(page);
     await expect(transport(page).locator('xpath=ancestor-or-self::*[@aria-live or @role="status" or @role="alert"]')).toHaveCount(0);
     await page.getByRole('combobox', { name: 'Steps per frame' }).selectOption('1');
-    await page.getByRole('button', { name: 'Start training', exact: true }).click();
+    await page.getByRole('button', { name: 'Play training', exact: true }).click();
     await expect(transport(page)).toHaveAttribute('data-status', 'running');
     await expect.poll(async () => Number(await transport(page).getAttribute('data-model-step'))).toBeGreaterThan(0);
     await page.getByRole('button', { name: 'Pause training', exact: true }).click();
@@ -125,6 +142,10 @@ test('canonical presets reset complete recipes and expose all multiclass cells',
     for (const recipe of Object.values(RECIPES)) {
         await applyPreset(page, recipe.title);
         await expectedRecipe(page, recipe);
+        if (recipe.taskKind === 'regression') {
+            await expectLinkedPanels(page.getByRole('tablist', { name: 'Results views' }), 'results', ['boundary', 'learning'], 'learning');
+            await expect(page.locator('#results-errors')).toHaveCount(0);
+        }
     }
     await workspace(page, 'Network');
     await expect(page.getByRole('region', { name: 'Architecture summary' })).toContainText('X₁, X₂ -> [6] -> [6] -> 3 outputs (softmax)');
@@ -177,12 +198,86 @@ test('cross-tab saved-run memory follows native localStorage events', async ({ c
     expect(browserErrors.get(peer)).toEqual([]);
 });
 
+test('the single-neuron exercise previews and publishes a seeded recipe with visible learning in three steps', async ({ page }) => {
+    await page.goto('./');
+    await ready(page);
+    const original = await identity(page);
+    const invitation = page.getByRole('complementary', { name: 'Getting started' });
+    const start = invitation.getByRole('button', { name: 'Train a single neuron' });
+    await start.press('Enter');
+    const instructions = page.getByRole('region', { name: 'Train a single neuron' });
+    await expect(instructions.getByRole('heading')).toBeFocused();
+    await expect(instructions).toContainText('press Step three times');
+    const setup = page.getByRole('region', { name: 'Experiment setup' });
+    await expect(setup.getByRole('textbox', { name: 'Samples', exact: true })).toHaveValue('80');
+    await expect(setup.getByText('40 training · 40 test samples', { exact: true })).toBeVisible();
+    expect(await identity(page)).toEqual(original);
+
+    await setup.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await expect(instructions).toBeHidden();
+    expect(await identity(page)).toEqual(original);
+    const tabs = page.getByRole('tablist', { name: 'Experiment workspace' });
+    await tabs.getByRole('tab', { name: 'Network', exact: true }).click();
+    await start.click();
+    const apply = setup.getByRole('button', { name: 'Apply changes', exact: true });
+    await apply.click();
+    await expect(setup).toHaveAttribute('aria-busy', 'false');
+    await expect(apply).toBeDisabled();
+    await expect(transport(page)).not.toHaveAttribute('data-model-generation', original.generation!);
+    await expect(transport(page)).toHaveAttribute('data-model-step', '0');
+    await expect(instructions).toContainText('press Step three times');
+    const applied = await identity(page);
+    const payload = new URLSearchParams(new URL(applied.url).hash.slice(1)).get('r');
+    expect(payload).not.toBeNull();
+    const { recipe } = JSON.parse(Buffer.from(payload!, 'base64url').toString('utf8'));
+    expect(recipe).toMatchObject({
+        task: { dataset: 'gauss', kind: 'binary-classification' },
+        data: { sampleCount: 80, trainFraction: 0.5, noise: 0, seed: 42 },
+        inputs: { featureIds: ['x', 'y'] },
+        model: { hiddenLayers: [], initialization: 'zeros', seed: 42 },
+        training: { batchSize: 40, learningRate: 3 },
+    });
+
+    await tabs.getByRole('tab', { name: 'Results', exact: true }).click();
+    const prediction = page.getByRole('tabpanel', { name: 'Prediction', exact: true });
+    const canvas = prediction.getByRole('img', { name: /Decision boundary visualization/ });
+    await expect(prediction).toContainText('Prediction grid at model step 0.');
+    const hues = () => canvas.evaluate((node: HTMLCanvasElement) => {
+        const context = node.getContext('2d')!;
+        return [[0.99, 0.01], [0.01, 0.99]].map(([x, y]) => {
+            const [red, , blue, alpha] = context.getImageData(Math.floor(x * node.width), Math.floor(y * node.height), 1, 1).data;
+            return { difference: red - blue, alpha };
+        });
+    });
+    await expect.poll(async () => (await hues()).map(({ alpha }) => alpha)).toEqual([255, 255]);
+    const [initialOrange, initialBlue] = await hues();
+    expect(initialOrange).toEqual(initialBlue);
+    const loss = prediction.locator('.atelier-metrics > div').filter({ hasText: 'Training loss' }).locator('dd');
+    await expect(loss).toContainText('0.6931');
+
+    const step = page.getByRole('button', { name: 'Run one training step' });
+    for (let count = 1; count <= 3; count++) {
+        await step.click();
+        await expect(transport(page)).toHaveAttribute('data-model-step', String(count));
+    }
+    await expect(prediction).toContainText('Prediction grid at model step 3.');
+    await expect(prediction).toContainText('Full evaluation at step 3.');
+    expect(Number.parseFloat(await loss.innerText())).toBeLessThan(0.6931);
+    await expect.poll(async () => {
+        const [orange, blue] = await hues();
+        return Math.min(orange.difference - initialOrange.difference, initialBlue.difference - blue.difference);
+    }).toBeGreaterThan(20);
+    expect(await identity(page)).toMatchObject({ url: applied.url, generation: applied.generation, step: '3' });
+});
+
 test('paused scientific evidence, checkpoints, records and code preference survive all navigation and guidance', async ({ page }) => {
-    await load(page);
+    await page.goto('./');
+    await ready(page);
     await applyPreset(page, RECIPES.xor.title);
     await learning(page);
+    await expectEvidence(page, 0);
     await page.getByRole('combobox', { name: 'Steps per frame' }).selectOption('50');
-    await page.getByRole('button', { name: /^(Start|Resume) training$/ }).click();
+    await page.getByRole('button', { name: 'Play training', exact: true }).click();
     await expect.poll(async () => Number(await transport(page).getAttribute('data-model-step'))).toBeGreaterThanOrEqual(50);
     await page.getByRole('button', { name: 'Pause training', exact: true }).click();
     const paused = await converge(page);
@@ -192,37 +287,100 @@ test('paused scientific evidence, checkpoints, records and code preference survi
     await history.getByRole('button', { name: 'Save current run' }).click();
     await expect(history.getByRole('article')).toHaveCount(1);
     const records = await page.evaluate(key => localStorage.getItem(key), MEMORY_KEY);
-    await learning(page);
+    await page.getByRole('button', { name: 'Playground', exact: true }).click();
+    const learningPanel = page.getByRole('tabpanel', { name: 'Learning progress' });
+    await expect(learningPanel).toBeVisible();
     const before = await identity(page);
     await utility(page, 'Session checkpoints');
     const slider = page.getByRole('slider', { name: 'Checkpoint timeline' });
-    const checkpoint = { max:await slider.getAttribute('max'), value:await slider.inputValue(), label:await slider.getAttribute('aria-valuetext') };
+    const readCheckpoint = () => slider.evaluate((input: HTMLInputElement) => ({
+        max: input.max, value: input.value, label: input.getAttribute('aria-valuetext'),
+    }));
+    const checkpoint = await readCheckpoint();
     expect(Number(checkpoint.max)).toBeGreaterThanOrEqual(1);
     await page.keyboard.press('Escape');
     await utility(page, 'Export / import');
-    await page.getByRole('tab', { name: 'Code', exact: true }).click();
-    await page.getByRole('tab', { name: 'NumPy', exact: true }).click();
+    const exports = page.getByRole('dialog', { name: 'Export / import' });
+    const code = exports.getByRole('tab', { name: 'Code', exact: true });
+    const numpy = exports.getByRole('tab', { name: 'NumPy', exact: true });
+    await code.click();
+    await numpy.click();
     await page.keyboard.press('Escape');
+    const views = page.getByRole('tablist', { name: 'Experiment workspace' });
     for (const mode of ['beginner', 'explore', 'lab']) {
-        await utility(page, 'Guidance');
-        await page.getByRole('combobox', { name: 'Explanation density' }).selectOption(mode);
-        await page.keyboard.press('Escape');
-        for (const view of ['Setup', 'Network', 'Results', 'Inspect'] as const) {
-            await workspace(page, view);
-            expect(await identity(page)).toEqual(before);
-        }
-        await utility(page, 'Export / import');
-        await page.getByRole('tab', { name: 'Code', exact: true }).click();
-        await expect(page.getByRole('tab', { name: 'NumPy', exact: true })).toHaveAttribute('aria-selected', 'true');
-        await page.keyboard.press('Escape');
-        await utility(page, 'Session checkpoints');
-        expect({ max:await slider.getAttribute('max'), value:await slider.inputValue(), label:await slider.getAttribute('aria-valuetext') }).toEqual(checkpoint);
-        await page.keyboard.press('Escape');
-        await learning(page);
-        await expectEvidence(page, paused+1);
-        expect(await page.evaluate(key => localStorage.getItem(key), MEMORY_KEY)).toBe(records);
+        await test.step(`Preserves the paused experiment with ${mode} guidance`, async () => {
+            await utility(page, 'Guidance');
+            const density = page.getByRole('combobox', { name: 'Explanation density' });
+            await density.selectOption(mode);
+            await expect(density).toHaveValue(mode);
+            await page.keyboard.press('Escape');
+            for (const view of ['Setup', 'Network', 'Inspect', 'Results'] as const) {
+                await views.getByRole('tab', { name: view, exact: true }).click();
+                await expect(page.getByRole('tabpanel', { name: view, exact: true })).toBeVisible();
+                expect(await identity(page)).toEqual(before);
+            }
+            await utility(page, 'Export / import');
+            await expect(code).toHaveAttribute('aria-selected', 'true');
+            await expect(numpy).toHaveAttribute('aria-selected', 'true');
+            await page.keyboard.press('Escape');
+            await utility(page, 'Session checkpoints');
+            expect(await readCheckpoint()).toEqual(checkpoint);
+            await page.keyboard.press('Escape');
+            await expect(learningPanel).toBeVisible();
+            await expectEvidence(page, paused + 1);
+            expect(await page.evaluate(key => localStorage.getItem(key), MEMORY_KEY)).toBe(records);
+        });
     }
 });
+
+for (const { width, zoom, label } of [
+    { width: 390, zoom: 1, label: 'at compact width' },
+    { width: 1280, zoom: 2, label: 'at 200% document zoom' },
+]) {
+    test(`Network, Results and Export expose named panels by keyboard ${label}`, async ({ page, browserName }) => {
+        await page.setViewportSize({ width, height: 900 });
+        await page.goto('./');
+        await ready(page);
+        await page.evaluate((value) => { document.documentElement.style.zoom = String(value); }, zoom);
+
+        const tabKey = browserName === 'webkit' && process.platform === 'darwin' ? 'Alt+Tab' : 'Tab';
+        const workspaceTabs = page.getByRole('tablist', { name: 'Experiment workspace' });
+        const networkTabs = page.getByRole('tablist', { name: 'Network regions' });
+        await expectLinkedPanels(workspaceTabs, 'workspace', ['setup', 'network', 'results', 'inspect'], 'network');
+        await expectLinkedPanels(networkTabs, 'network-region', ['network', 'data', 'prediction'], 'network');
+        await networkTabs.getByRole('tab', { name: 'Network' }).press('ArrowRight');
+        await expect(networkTabs.getByRole('tab', { name: 'Data' })).toBeFocused();
+        await expectLinkedPanels(networkTabs, 'network-region', ['network', 'data', 'prediction'], 'data');
+        await page.keyboard.press(tabKey);
+        await expect(page.getByRole('tabpanel', { name: 'Data' })).toBeFocused();
+
+        await workspaceTabs.getByRole('tab', { name: 'Network' }).press('ArrowRight');
+        const resultsTabs = page.getByRole('tablist', { name: 'Results views' });
+        await expectLinkedPanels(resultsTabs, 'results', ['boundary', 'learning', 'errors'], 'boundary');
+        await resultsTabs.getByRole('tab', { name: 'Prediction' }).press('ArrowRight');
+        await expect(resultsTabs.getByRole('tab', { name: 'Learning progress' })).toBeFocused();
+        await expectLinkedPanels(resultsTabs, 'results', ['boundary', 'learning', 'errors'], 'learning');
+        const learningPanel = page.getByRole('tabpanel', { name: 'Learning progress' });
+        await expect(learningPanel.getByRole('region', { name: 'Current run' })).toBeVisible();
+        await page.keyboard.press(tabKey);
+        await expect(learningPanel).toBeFocused();
+
+        await page.getByRole('button', { name: 'Utilities' }).press('Enter');
+        await page.getByRole('menuitem', { name: 'Export / import' }).press('Enter');
+        const dialog = page.getByRole('dialog', { name: 'Export / import' });
+        const exportTabs = dialog.getByRole('tablist', { name: 'Export type' });
+        await expectLinkedPanels(exportTabs, 'export', ['setup', 'code'], 'setup');
+        await exportTabs.getByRole('tab', { name: 'Setup & sharing' }).press('ArrowRight');
+        await expect(exportTabs.getByRole('tab', { name: 'Code' })).toBeFocused();
+        await expectLinkedPanels(exportTabs, 'export', ['setup', 'code'], 'code');
+        const codePanel = dialog.getByRole('tabpanel', { name: 'Code', exact: true });
+        await expect(codePanel.getByRole('tablist', { name: 'Code format' })).toBeVisible();
+        await page.keyboard.press(tabKey);
+        await expect(codePanel).toBeFocused();
+        await page.keyboard.press('Escape');
+        await expect(dialog).toBeHidden();
+    });
+}
 
 for (const width of [1440,1401,1280,950,901,800,390,320]) {
     test(`global controls remain inside the header at ${width}px`, async ({ page }) => {
@@ -243,7 +401,7 @@ for (const width of [1440,1401,1280,950,901,800,390,320]) {
 test('reduced motion disables shell animation and transitions', async ({ page }) => {
     await page.emulateMedia({ reducedMotion:'reduce' });
     await load(page);
-    await page.getByRole('button', { name:'Start training' }).click();
+    await page.getByRole('button', { name:'Play training' }).click();
     await expect(transport(page)).toHaveAttribute('data-status','running');
     const motion = await page.locator('.atelier button, .atelier-tabs').evaluateAll(nodes => nodes.map(node => ({ animation:getComputedStyle(node).animationName, transition:getComputedStyle(node).transitionDuration })));
     expect(motion.every(value=>value.animation==='none' && value.transition.split(',').every(duration=>Number.parseFloat(duration)===0))).toBe(true);

@@ -4,6 +4,7 @@ import {
     DEFAULT_EXPERIMENT_DOCUMENT,
     GRID_SIZE,
     MAX_ACTIVE_FEATURE_COUNT,
+    MAX_CHECKPOINT_BRANCH_STEPS,
     MAX_HIDDEN_LAYERS,
     MAX_NEURONS_PER_LAYER,
     MAX_OUTPUT_CLASSES,
@@ -617,5 +618,31 @@ describe('version 2 worker protocol boundaries', () => {
             restoredCheckpointId: 1,
         })).toThrow(/malformed|checkpoint/i);
         expect(() => parseCheckpointTimelineV2({ ...timeline, payload: {} })).toThrow(/exactly/i);
+
+        const branch = {
+            ...timeline,
+            checkpoints: timeline.checkpoints.map((point) => ({
+                ...point, trajectoryGuarantee: 'same-recipe-training-trajectory',
+            })),
+            restoredCheckpointId: null,
+            branch: { sourceCheckpointId: 1, previousCheckpointId: 2, targetStep: 15 },
+        };
+        expect(parseCheckpointTimelineV2(branch)).toEqual(branch);
+        expect(() => parseCheckpointTimelineV2({ ...branch, checkpoints: timeline.checkpoints }))
+            .toThrow(/requires reproducible checkpoints/);
+        expect(() => parseCheckpointTimelineV2({ ...branch, branch: { ...branch.branch, targetStep: 0 } }))
+            .toThrow(/targetStep/);
+    });
+
+    it('accepts bounded branch step counts and rejects oversized or fractional ones', () => {
+        const request = {
+            type: 'branch-checkpoint', protocolVersion: 2, requestId: 7, checkpointId: 1,
+            trainingSteps: MAX_CHECKPOINT_BRANCH_STEPS,
+        };
+        expect(parseMainToWorkerRequestV2(request)).toEqual(request);
+        for (const count of [0, 1.5, MAX_CHECKPOINT_BRANCH_STEPS + 1]) {
+            expect(() => parseMainToWorkerRequestV2({ ...request, trainingSteps: count }))
+                .toThrow(/invalid version-2 request/);
+        }
     });
 });

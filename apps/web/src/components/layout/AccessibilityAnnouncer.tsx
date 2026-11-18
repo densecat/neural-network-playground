@@ -30,6 +30,8 @@ const CONFIG_START_MESSAGES = {
     training: 'Updating training',
     preset: 'Applying preset',
     setup: 'Applying setup',
+    'saved-run': 'Applying saved recipe',
+    url: 'Applying shared setup',
 } as const;
 
 const CONFIG_SCOPE_LABELS = {
@@ -39,6 +41,8 @@ const CONFIG_SCOPE_LABELS = {
     training: 'Training',
     preset: 'Preset',
     setup: 'Setup',
+    'saved-run': 'Saved recipe',
+    url: 'Shared setup',
 } as const;
 
 export function AccessibilityAnnouncer(props: AccessibilityAnnouncerProps) {

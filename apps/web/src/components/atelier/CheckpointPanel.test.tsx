@@ -3,12 +3,26 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { CheckpointPanel } from './CheckpointPanel.tsx';
 import type { TrainingHook } from '../../hooks/useTraining.ts';
 import { useTrainingStore } from '../../store/useTrainingStore.ts';
-import type { LiveTrainingSignal, PairedEvaluation } from '@nn-playground/shared';
+import type { CheckpointSummary, LiveTrainingSignal, PairedEvaluation } from '@nn-playground/shared';
 
 function hook() {
-    return { pause: vi.fn(() => useTrainingStore.setState({ status: 'paused' })), restoreCheckpoint: vi.fn().mockImplementation(async (id: number) => useTrainingStore.setState((state) => ({ checkpointTimeline: { ...state.checkpointTimeline, restoredCheckpointId: id } }))) } as unknown as TrainingHook;
+    return {
+        pause: vi.fn(() => useTrainingStore.setState({ status: 'paused' })),
+        restoreCheckpoint: vi.fn().mockImplementation(async (id: number) => useTrainingStore.setState((state) => ({
+            checkpointTimeline: { ...state.checkpointTimeline, restoredCheckpointId: id },
+        }))),
+        branchCheckpoint: vi.fn().mockImplementation(async (id: number, trainingSteps: number) => useTrainingStore.setState((state) => ({
+            checkpointTimeline: {
+                ...state.checkpointTimeline, restoredCheckpointId: null,
+                branch: { sourceCheckpointId: id, previousCheckpointId: 2, targetStep: trainingSteps },
+            },
+        }))),
+    } as unknown as TrainingHook;
 }
-const checkpoint = (id: number, step: number) => ({ id, step, epoch: 0, trainDataLoss: .15, testDataLoss: .18, label: `Step ${step}` });
+const checkpoint = (id: number, step: number): CheckpointSummary => ({
+    id, step, epoch: 0, trainDataLoss: .15, testDataLoss: .18, label: `Step ${step}`,
+    trajectoryGuarantee: 'same-recipe-training-trajectory',
+});
 beforeEach(() => {
     useTrainingStore.setState({ status: 'paused', pendingConfigSource: null, latestLiveSignal: null, latestEvaluation: null,
         checkpointTimeline: { checkpoints: [checkpoint(1, 0), checkpoint(2, 400)], maxCheckpoints: 8, evictedCount: 0, liveCheckpointId: 2, restoredCheckpointId: null } });
@@ -17,16 +31,46 @@ describe('Session checkpoints', () => {
     it('selection only previews; explicit restore calls the existing command once', async () => {
         const training = hook(); render(<CheckpointPanel training={training} />);
         fireEvent.change(screen.getByRole('slider'), { target: { value: '0' } });
-        expect(screen.getByText('Not restored yet')).toBeInTheDocument();
+        expect(screen.queryByRole('status')).not.toBeInTheDocument();
         expect(training.restoreCheckpoint).not.toHaveBeenCalled();
         fireEvent.click(screen.getByRole('button', { name: 'Restore Step 0' }));
         await screen.findByText('Restored checkpoint');
         expect(training.restoreCheckpoint).toHaveBeenCalledExactlyOnceWith(1);
     });
+    it('branches from the selection and lets the user find the former live checkpoint', async () => {
+        const training = hook(); render(<CheckpointPanel training={training} />);
+        fireEvent.change(screen.getByRole('slider'), { target: { value: '0' } });
+        const budget = screen.getByRole('spinbutton', { name: 'Optimizer steps for this branch' });
+        fireEvent.change(budget, { target: { value: '0' } });
+        expect(screen.getByRole('button', { name: 'Branch from checkpoint' })).toBeDisabled();
+        fireEvent.change(budget, { target: { value: '7' } });
+        expect(training.branchCheckpoint).not.toHaveBeenCalled();
+        fireEvent.click(screen.getByRole('button', { name: 'Branch from checkpoint' }));
+        expect(await screen.findByRole('status')).toHaveTextContent('Branched from Step 0. Previous live model saved at Step 400.');
+        expect(training.branchCheckpoint).toHaveBeenCalledExactlyOnceWith(1, 7);
+        expect(screen.getByText('Play to train through step 7.')).toBeInTheDocument();
+        expect(training.restoreCheckpoint).not.toHaveBeenCalled();
+        fireEvent.click(screen.getByRole('button', { name: 'Select previous live checkpoint' }));
+        expect(screen.getByRole('slider')).toHaveAttribute('aria-valuetext', 'Step 400');
+    });
+    it('offers restore and the limited guarantee for legacy checkpoints', () => {
+        useTrainingStore.setState((state) => ({
+            checkpointTimeline: {
+                ...state.checkpointTimeline,
+                checkpoints: [{ ...checkpoint(1, 0), trajectoryGuarantee: 'parameters-and-optimizer-only' }],
+                liveCheckpointId: 1,
+            },
+        }));
+        render(<CheckpointPanel training={hook()} />);
+        expect(screen.getByRole('button', { name: 'Branch from checkpoint' })).toBeDisabled();
+        expect(screen.getByRole('button', { name: 'Restore Step 0' })).toBeEnabled();
+        expect(screen.getByText(/Future shuffles may differ/)).toBeInTheDocument();
+    });
     it('exposes Pause while running and blocks restore until paused', async () => {
         useTrainingStore.setState({ status: 'running' });
         const training = hook(); render(<CheckpointPanel training={training} />);
         expect(screen.getByRole('button', { name: 'Restore Step 400' })).toBeDisabled();
+        expect(screen.getByRole('button', { name: 'Branch from checkpoint' })).toBeDisabled();
         fireEvent.click(screen.getByRole('button', { name: 'Pause training' }));
         expect(training.pause).toHaveBeenCalledOnce();
         expect(screen.getByRole('button', { name: 'Restore Step 400' })).toBeEnabled();
@@ -42,7 +86,7 @@ describe('Session checkpoints', () => {
         fireEvent.click(screen.getByRole('button', { name: 'Restore Step 400' }));
         expect(await screen.findByRole('alert')).toHaveTextContent('Select another checkpoint');
         expect(screen.getByRole('button', { name: 'Restore Step 400' })).toBeEnabled();
-        expect(screen.getByText('Not restored yet')).toBeInTheDocument();
+        expect(screen.queryByRole('status')).not.toBeInTheDocument();
     });
     it('reports the newest scientific model step independently of selected checkpoint', () => {
         const model = (step: number) => ({ generationId: 1, revision: step, step, epoch: 0 });

@@ -208,6 +208,8 @@ describe('training worker scientific-trust V2 boundary', () => {
             'stepArena',
             'getTrainPoints',
             'getTestPoints',
+            'getTrainPointsV2',
+            'getTestPointsV2',
             'getPredictionTrace',
             'getBackpropExplanation',
             'getLossLandscapeProbe',
@@ -221,8 +223,7 @@ describe('training worker scientific-trust V2 boundary', () => {
     it('rejects stream start before V2 initialization without publishing run zero status', async () => {
         const capture = createCapturingPort();
         workerApi.setStreamPort(capture.port);
-        expect(() => workerApi.getTrainPointsV2()).toThrow('V2 experiment is not initialized');
-        expect(() => workerApi.getTestPointsV2()).toThrow('V2 experiment is not initialized');
+        expect(() => workerApi.getDatasetPointsV2(1, 'dataset')).toThrow('V2 experiment is not initialized');
 
         capture.dispatch({
             type: 'startTraining',
@@ -249,12 +250,15 @@ describe('training worker scientific-trust V2 boundary', () => {
         const initialized = await workerApi.initializeExperimentV2(withFreshId(fixtures.request));
         const model = initialized.evidence.latestEvaluation!.model;
         const historyBefore = workerApi.getMetricHistoryV2();
-        expect(workerApi.getTrainPointsV2()).toHaveLength(
-            initialized.evidence.latestEvaluation!.dataset.trainCount,
-        );
-        expect(workerApi.getTestPointsV2()).toHaveLength(
-            initialized.evidence.latestEvaluation!.dataset.testCount,
-        );
+        const { dataset } = initialized.evidence.latestEvaluation!;
+        const points = workerApi.getDatasetPointsV2(initialized.runId, dataset.datasetKey);
+        expect(points).toMatchObject({ runId: initialized.runId, dataset });
+        expect(points.trainPoints).toHaveLength(dataset.trainCount);
+        expect(points.testPoints).toHaveLength(dataset.testCount);
+        expect(() => workerApi.getDatasetPointsV2(initialized.runId - 1, dataset.datasetKey))
+            .toThrow('dataset points request does not match the active experiment');
+        expect(() => workerApi.getDatasetPointsV2(initialized.runId, 'another dataset'))
+            .toThrow('dataset points request does not match the active experiment');
 
         const trace = await workerApi.getPredictionTraceV2({ source: 'train', index: 0 });
         expect(trace).toMatchObject({
@@ -453,7 +457,10 @@ describe('training worker scientific-trust V2 boundary', () => {
         });
         expect(result.checkpointTimeline).toEqual(timeline);
         expect(timeline.checkpoints).toHaveLength(1);
-        expect(timeline.checkpoints[0]).toMatchObject({ id: 1, step: 0, epoch: 0 });
+        expect(timeline.checkpoints[0]).toMatchObject({
+            id: 1, step: 0, epoch: 0,
+            trajectoryGuarantee: 'same-recipe-training-trajectory',
+        });
         expect(evidenceMessages(capture.messages).filter(
             (message) => message.latestEvaluation?.trigger === 'checkpoint',
         )).toEqual([]);
@@ -818,8 +825,7 @@ describe('training worker scientific-trust V2 boundary', () => {
         const baselineId = baselineCapture.checkpointTimeline.liveCheckpointId!;
         const baseline = getV2CheckpointForTests(baselineId);
 
-        const malformed = getV2CheckpointForTests(1) as SessionCheckpointV2 & Record<string, unknown>;
-        malformed.extra = true;
+        const malformed = { ...getV2CheckpointForTests(1), extra: true };
         replaceV2CheckpointForTests(1, malformed);
         const timelineBeforeMalformed = getV2CheckpointTimelineForTests();
         await expect(workerApi.restoreCheckpointV2({
@@ -845,7 +851,7 @@ describe('training worker scientific-trust V2 boundary', () => {
         replaceV2CheckpointForTests(baselineId, baseline);
         const evaluateObjective = Network.prototype.evaluateObjective;
         const evaluatedNetworks = new Set<Network>();
-        vi.spyOn(Network.prototype, 'evaluateObjective').mockImplementation(function (
+        const evaluateTrain = vi.spyOn(Network.prototype, 'evaluateObjective').mockImplementation(function (
             this: Network,
             ...args: Parameters<Network['evaluateObjective']>
         ) {
@@ -862,6 +868,7 @@ describe('training worker scientific-trust V2 boundary', () => {
             checkpointId: baselineId,
         });
         expect(evaluatedNetworks.size).toBe(1);
+        expect(evaluateTrain).toHaveBeenCalledTimes(1);
         expect(restored.evidence.latestEvaluation?.trigger).toBe('restore');
         expect(restored.checkpointTimeline.restoredCheckpointId).toBe(baselineId);
 
@@ -986,6 +993,225 @@ describe('training worker scientific-trust V2 boundary', () => {
         expect(shuffleSpy).toHaveBeenCalledTimes(1);
         expect(trainSpy.mock.calls.at(-1)?.[3]).toBe(0);
         expect(stepped.evidence.liveSignal?.model.epoch).toBe(1);
+    });
+
+    it.each([15, 16])('replays the same scheduled Adam batches after branching from step %i', async (sourceStep) => {
+        const { prepared: { document } } = await createScientificTrustFixtures();
+        const configured = await prepareExperimentDocument({
+            ...document,
+            recipe: {
+                ...document.recipe,
+                data: { ...document.recipe.data, sampleCount: 305 },
+                training: {
+                    ...document.recipe.training,
+                    schedule: { kind: 'step', interval: 5, gamma: 0.8 },
+                    optimizer: { kind: 'adam', beta1: 0.9, beta2: 0.999, epsilon: 1e-8 },
+                },
+            },
+        });
+        if (!configured.ok) throw new Error(JSON.stringify(configured.issues));
+        await workerApi.initializeExperimentV2(requestForPrepared(configured.value));
+
+        const capture = () => workerApi.captureCheckpointV2({
+            type: 'capture-checkpoint', protocolVersion: WORKER_PROTOCOL_VERSION,
+            requestId: nextRequestId++,
+        });
+        await workerApi.stepExperimentV2(10);
+        await workerApi.stepExperimentV2(sourceStep - 10);
+        const checkpointId = (await capture()).checkpointTimeline.liveCheckpointId!;
+        const source = getV2CheckpointForTests(checkpointId);
+        expect(source).toMatchObject({ schemaVersion: 3, model: { step: sourceStep } });
+
+        const train = Network.prototype.trainBatchIndexedV2;
+        let batches: Array<{ indices: number[]; dataLoss: number }> = [];
+        vi.spyOn(Network.prototype, 'trainBatchIndexedV2').mockImplementation(function (
+            this: Network,
+            ...args: Parameters<Network['trainBatchIndexedV2']>
+        ) {
+            const [, , indices, start, end] = args;
+            const result = train.apply(this, args);
+            batches.push({
+                indices: Array.from(indices).slice(start, end),
+                dataLoss: result.postUpdateDataLoss,
+            });
+            return result;
+        });
+        await workerApi.stepExperimentV2(10);
+        await workerApi.stepExperimentV2(9);
+        const expectedBatches = batches;
+        expect(expectedBatches).toHaveLength(19);
+        expect(expectedBatches.some(({ indices }) => indices.length === 2)).toBe(true);
+
+        const branched = await workerApi.branchCheckpointV2({
+            type: 'branch-checkpoint', protocolVersion: WORKER_PROTOCOL_VERSION,
+            requestId: nextRequestId++, checkpointId,
+        });
+        const { branch, restoredCheckpointId } = branched.checkpointTimeline;
+        expect(branch?.sourceCheckpointId).toBe(checkpointId);
+        expect(restoredCheckpointId).toBeNull();
+        const originalId = branch!.previousCheckpointId;
+        const original = getV2CheckpointForTests(originalId);
+        expect(original.model.step).toBe(sourceStep + 19);
+        expect(original.optimizer.kind).toBe('adam');
+        expect(branched.snapshot.step).toBe(sourceStep);
+
+        batches = [];
+        await workerApi.stepExperimentV2(10);
+        await workerApi.stepExperimentV2(9);
+        const replay = getV2CheckpointForTests((await capture()).checkpointTimeline.liveCheckpointId!);
+        expect(batches).toEqual(expectedBatches);
+        expect(replay.network).toEqual(original.network);
+        expect(replay.optimizer).toEqual(original.optimizer);
+        expect(replay.cursor).toEqual(original.cursor);
+        expect(replay.evaluation.train).toEqual(original.evaluation.train);
+        expect(replay.evaluation.test).toEqual(original.evaluation.test);
+        expect(getV2CheckpointForTests(originalId)).toEqual(original);
+
+        const restored = await workerApi.restoreCheckpointV2({
+            type: 'restore-checkpoint', protocolVersion: WORKER_PROTOCOL_VERSION,
+            requestId: nextRequestId++, checkpointId: originalId,
+        });
+        expect(restored.checkpointTimeline).toMatchObject({ restoredCheckpointId: originalId });
+        expect(restored.checkpointTimeline.branch).toBeUndefined();
+        expect(restored.snapshot.step).toBe(original.model.step);
+    });
+
+    it('restores legacy V2 checkpoints while requiring V3 for reproducible branches', async () => {
+        const fixtures = await createScientificTrustFixtures();
+        await workerApi.initializeExperimentV2(withFreshId(fixtures.request));
+        const saved = getV2CheckpointForTests(1);
+        const { epoch, batchStart, shuffledIndices } = saved.cursor;
+        const legacy: SessionCheckpointV2 = {
+            ...saved,
+            schemaVersion: 2,
+            cursor: { epoch, batchStart, shuffledIndices },
+            trajectoryGuarantee: 'parameters-and-optimizer-only',
+        };
+        replaceV2CheckpointForTests(1, legacy);
+        await workerApi.stepExperimentV2(1);
+        const before = getV2CheckpointTimelineForTests();
+        await expect(workerApi.branchCheckpointV2({
+            type: 'branch-checkpoint', protocolVersion: WORKER_PROTOCOL_VERSION,
+            requestId: nextRequestId++, checkpointId: 1,
+        })).rejects.toThrow(/requires a checkpoint with saved shuffle state/i);
+        expect(getV2CheckpointTimelineForTests()).toEqual(before);
+        const restored = await workerApi.restoreCheckpointV2({
+            type: 'restore-checkpoint', protocolVersion: WORKER_PROTOCOL_VERSION,
+            requestId: nextRequestId++, checkpointId: 1,
+        });
+        expect(restored.snapshot.step).toBe(0);
+        expect(restored.checkpointTimeline.restoredCheckpointId).toBe(1);
+    });
+
+    it('compares different step budgets from one source and stops each at the exact limit', async () => {
+        vi.useFakeTimers();
+        const fixtures = await createScientificTrustFixtures();
+        const capture = createCapturingPort();
+        workerApi.setStreamPort(capture.port);
+        await workerApi.initializeExperimentV2(withFreshId(fixtures.request));
+        await workerApi.stepExperimentV2(1);
+
+        const startBranch = (trainingSteps: number) => workerApi.branchCheckpointV2({
+            type: 'branch-checkpoint', protocolVersion: WORKER_PROTOCOL_VERSION,
+            requestId: nextRequestId++, checkpointId: 1, trainingSteps,
+        });
+        const finishBranch = async (targetStep: number) => {
+            const start = capture.messages.length;
+            capture.dispatch({ type: 'startTraining', stepsPerFrame: 50 });
+            await flushMicrotasks();
+            await vi.advanceTimersByTimeAsync(100);
+            const messages = capture.messages.slice(start);
+            const status = messages.findIndex((message) => (
+                (message as { pauseReason?: string }).pauseReason === 'max-steps'
+            ));
+            expect(status).toBeGreaterThan(0);
+            expect(snapshotMessages(messages.slice(0, status)).at(-1)?.model?.step).toBe(targetStep);
+            const history = workerApi.getMetricHistoryV2();
+            expect(history.trendHistory).toHaveLength(targetStep);
+            expect(history.evaluationHistory.at(-1)?.model.step).toBe(targetStep);
+        };
+
+        const first = await startBranch(3);
+        expect(first.checkpointTimeline.branch).toMatchObject({ sourceCheckpointId: 1, targetStep: 3 });
+        const originalId = first.checkpointTimeline.branch!.previousCheckpointId;
+        await finishBranch(3);
+        const firstTrend = workerApi.getMetricHistoryV2().trendHistory.map((point) => point.dataLoss);
+
+        const second = await startBranch(7);
+        expect(second.checkpointTimeline.branch).toMatchObject({ sourceCheckpointId: 1, targetStep: 7 });
+        expect(getV2CheckpointForTests(second.checkpointTimeline.branch!.previousCheckpointId).model.step).toBe(3);
+        await workerApi.stepExperimentV2(2);
+        await finishBranch(7);
+        expect(workerApi.getMetricHistoryV2().trendHistory.slice(0, 3).map((point) => point.dataLoss)).toEqual(firstTrend);
+        expect((await workerApi.stepExperimentV2(10)).snapshot.step).toBe(7);
+        expect(getV2CheckpointForTests(originalId).model.step).toBe(1);
+    });
+
+    it.each([3, 50])('publishes matching Play and Step evidence and retains one branch endpoint at step %i', async (targetStep) => {
+        vi.useFakeTimers();
+        vi.stubGlobal('crossOriginIsolated', false);
+        const fixtures = await createScientificTrustFixtures();
+        const branchRequest = () => ({
+            type: 'branch-checkpoint', protocolVersion: WORKER_PROTOCOL_VERSION,
+            requestId: nextRequestId++, checkpointId: 1, trainingSteps: targetStep,
+        });
+        const start = async () => {
+            await workerApi.initializeExperimentV2(withFreshId(fixtures.request));
+            workerApi.updateDemand({
+                ...DEFAULT_DEMAND,
+                needActivationHistograms: true,
+                gridInterval: 20,
+                activationHistogramInterval: 20,
+            });
+            await workerApi.stepExperimentV2(1);
+            return workerApi.branchCheckpointV2(branchRequest());
+        };
+
+        const capture = createCapturingPort();
+        workerApi.setStreamPort(capture.port);
+        await start();
+        const firstPlayMessage = capture.messages.length;
+        capture.dispatch({ type: 'startTraining', stepsPerFrame: 1 });
+        await flushMicrotasks();
+        await vi.advanceTimersByTimeAsync(1000);
+        const playMessages = capture.messages.slice(firstPlayMessage);
+        const finalFrame = snapshotMessages(playMessages).at(-1)!;
+        const playEvaluation = evidenceMessages(playMessages).flatMap((message) => (
+            message.latestEvaluation ? [message.latestEvaluation] : []
+        )).at(-1)!;
+        expect(finalFrame.model.step).toBe(targetStep);
+        expect(playEvaluation.model).toEqual(finalFrame.model);
+        expect(finalFrame.checkpointTimeline.checkpoints.filter((point) => point.step === targetStep)).toHaveLength(1);
+
+        const branched = await start();
+        // Consume one direct snapshot before finishing so artifact cadence
+        // would skip the final model without the endpoint refresh.
+        for (let remaining = targetStep - 1; remaining > 0; remaining -= 10) {
+            await workerApi.stepExperimentV2(Math.min(10, remaining));
+        }
+        const stepped = await workerApi.stepExperimentV2(1);
+        expect(stepped.snapshot.step).toBe(targetStep);
+        expect(stepped.snapshot.outputGrid).toHaveLength(stepped.snapshot.gridSize ** 2);
+        expect(stepped.snapshot.outputGrid).toEqual(finalFrame.outputGrid);
+        expect(stepped.snapshot.neuronGrids).toEqual(finalFrame.neuronGrids);
+        expect(stepped.snapshot.activationHistograms?.bins).toEqual(finalFrame.activationHistogramBins);
+        expect(stepped.evidence.latestEvaluation?.train).toEqual(playEvaluation.train);
+        expect(stepped.evidence.latestEvaluation?.test).toEqual(playEvaluation.test);
+        expect(stepped.evidence.latestEvaluation?.objective).toEqual(playEvaluation.objective);
+        expect(finalFrame.artifacts?.activationHistogram?.model).toEqual(finalFrame.model);
+        expect(stepped.artifacts?.activationHistogram?.model).toEqual(stepped.evidence.latestEvaluation?.model);
+        const endpoints = stepped.checkpointTimeline.checkpoints.filter((point) => point.step === targetStep);
+        expect(endpoints).toHaveLength(1);
+        const endpointId = endpoints[0]!.id;
+        expect(stepped.checkpointTimeline.liveCheckpointId).toBe(endpointId);
+
+        const restored = await workerApi.restoreCheckpointV2({
+            type: 'restore-checkpoint', protocolVersion: WORKER_PROTOCOL_VERSION,
+            requestId: nextRequestId++, checkpointId: branched.checkpointTimeline.branch!.previousCheckpointId,
+        });
+        expect(restored.snapshot.step).toBe(1);
+        expect(restored.checkpointTimeline.checkpoints).toContainEqual(endpoints[0]);
+        expect(getV2CheckpointForTests(endpointId).model.step).toBe(targetStep);
     });
 
     it.each(['recipe', 'datasetKey', 'objectiveKey'] as const)(

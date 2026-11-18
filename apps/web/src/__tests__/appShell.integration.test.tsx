@@ -163,6 +163,9 @@ describe('App shell integration', () => {
         useTrainingStore.getState().resetEvidence();
         useTrainingStore.setState({
             status: 'idle',
+            datasetStatus: 'ready',
+            datasetError: null,
+            evidenceGenerationId: 7,
             trainedRecipe: null,
             trainedRecipeFingerprint: null,
             trainedRecipeRecordedAt: null,
@@ -233,10 +236,26 @@ describe('App shell integration', () => {
         expect(trigger).toHaveFocus();
     });
 
-    it('mounts only visible evidence and requests the same capabilities', async () => {
+    it.each(['beginner', 'explore', 'lab'] as const)('keeps Setup and evidence available with %s guidance', async (audienceMode) => {
+        useLayoutStore.setState({ audienceMode });
         const user = userEvent.setup(); render(<App />);
         expect(usePlaygroundStore.getState().demand.needDecisionBoundary).toBe(true);
+
+        const workspace = within(screen.getByRole('tablist', { name: 'Experiment workspace' }));
+        for (const name of ['Setup', 'Network', 'Results', 'Inspect']) {
+            expect(workspace.getByRole('tab', { name })).toBeVisible();
+        }
+        await user.click(workspace.getByRole('tab', { name: 'Setup' }));
+        const setup = within(screen.getByRole('navigation', { name: 'Setup sections' }));
+        for (const name of ['Data', 'Inputs & layers', 'Training']) {
+            expect(setup.getByRole('button', { name })).toBeVisible();
+        }
+        expect(screen.getByText('Start from a preset')).toBeVisible();
+
         await user.click(screen.getByRole('tab', {name:'Results'}));
+        const results = within(screen.getByRole('tablist', { name: 'Results views' }));
+        expect(results.getByRole('tab', { name: 'Prediction', selected: true })).toBeVisible();
+        expect(results.getByRole('tab', { name: 'Errors & confusion' })).toBeVisible();
         await user.click(screen.getByRole('tab', {name:'Learning progress'}));
         await screen.findByText('Mock Loss Chart');
         expect(screen.queryByText('Mock Boundary')).not.toBeInTheDocument();
@@ -246,6 +265,11 @@ describe('App shell integration', () => {
         expect(usePlaygroundStore.getState().demand).toMatchObject({needLayerStats:true,needActivationHistograms:false});
         act(() => useLayoutStore.getState().setInspectTab('activations'));
         expect(usePlaygroundStore.getState().demand.needActivationHistograms).toBe(true);
+        await user.click(screen.getByRole('button', { name: 'Share setup' }));
+        const exports = within(screen.getByRole('dialog', { name: 'Export / import' }));
+        await user.click(exports.getByRole('tab', { name: 'Code' }));
+        expect(await exports.findByText('Mock Code Export')).toBeVisible();
+        await user.click(exports.getByRole('button', { name: 'Close Export / import' }));
         await user.click(screen.getByRole('button', {name:'Saved runs'}));
         await screen.findByText('Mock Run History');
         expect(usePlaygroundStore.getState().demand).toMatchObject({needDecisionBoundary:false,needNeuronGrids:false,needLayerStats:false,needActivationHistograms:false,needConfusionMatrix:false});

@@ -1,18 +1,18 @@
-import { useMemo, type CSSProperties } from 'react';
+import { memo, useMemo, type CSSProperties, type ReactNode } from 'react';
 import { usePlaygroundStore } from '../../store/usePlaygroundStore.ts';
 import { useTrainingStore } from '../../store/useTrainingStore.ts';
 import { NetworkGraph } from '../visualization/NetworkGraph.tsx';
-import { DecisionBoundaryCanvas } from '../visualization/DecisionBoundaryCanvas.tsx';
 import { NetworkSelectionDeck } from '../visualization/NetworkSelectionDeck.tsx';
-import type { DecisionBoundaryController } from '../visualization/useDecisionBoundaryController.ts';
 import type { NetworkSelectionController } from '../visualization/useNetworkSelectionController.ts';
 import type { SetupTab } from '../../productShell/atelierTypes.ts';
-import { Icon, Tabs } from './ui.tsx';
+import { Icon, tabPanelProps, Tabs } from './ui.tsx';
 import { getDatasetContract } from '@nn-playground/engine';
 import { useThemeStore, readPlotPalette } from '../../store/theme.ts';
 import { CLASS_COLORS, fieldColor, hexRgb } from '../visualization/plotColors.ts';
+import { DatasetPlotStatus, selectDatasetPlotStatus } from './AtelierPrediction.tsx';
 
-function DataPlot() {
+const DataPlot = memo(function DataPlot() {
+    const status = useTrainingStore(selectDatasetPlotStatus);
     const points = useTrainingStore((s) => s.trainPoints);
     const test = useTrainingStore((s) => s.testPoints);
     const task = usePlaygroundStore((s) => s.access.status === 'ready' ? s.access.prepared.document.recipe.task : null);
@@ -24,6 +24,7 @@ function DataPlot() {
         const domain = task && getDatasetContract(task.dataset).targetDomain;
         return domain?.kind === 'continuous' ? domain.boundsForNoise(noise) : [0,1];
     }, [task,noise]);
+    if (status !== 'ready') return <DatasetPlotStatus className="atelier-data-plot" status={status} />;
     return <>
         <svg className="atelier-data-plot" viewBox="0 0 256 256" role="img" aria-label={`${points.length} training samples plotted by x and y; ${regression ? 'color shows continuous target' : 'color shows target class'}`}>
             {[64,128,192].map((p) => <g key={p} stroke="var(--border-color)" strokeWidth=".5"><path d={`M${p} 0V256 M0 ${p}H256`} /></g>)}
@@ -33,17 +34,47 @@ function DataPlot() {
         <p className="atelier-plot-caption">{points.length} training · {test.length} test samples<br />Active experiment · deterministic data split</p>
         {regression ? <p className="atelier-plot-caption">Target range {Number.isFinite(range[0]) ? range[0].toFixed(2) : '—'} to {Number.isFinite(range[1]) ? range[1].toFixed(2) : '—'}</p> : <div className="atelier-class-legend">{CLASS_COLORS.slice(0,task?.kind === 'multiclass-classification' ? 3 : 2).map((color,index) => <span key={index}><i style={{ '--class-color':color } as CSSProperties} />Class {index}</span>)}</div>}
     </>;
+});
+
+export type NetworkRegion = 'data' | 'network' | 'prediction';
+const NETWORK_REGIONS = [{ id: 'network', label: 'Network' }, { id: 'data', label: 'Data' }, { id: 'prediction', label: 'Prediction' }] as const;
+const NETWORK_PANEL_PREFIX = 'network-region';
+
+export interface AtelierNetworkProps {
+    layout: 'compact' | 'stacked' | 'wide';
+    region: NetworkRegion;
+    onRegionChange(region: NetworkRegion): void;
+    prediction: ReactNode;
+    graph: NetworkSelectionController;
+    onSetup(tab: SetupTab): void;
+    onResults(): void;
 }
 
-type NetworkRegion = 'data' | 'network' | 'prediction';
-export function AtelierNetwork({ boundary, selection, onSetup, onResults, compact = false, region = 'network', onRegionChange }: { compact?: boolean; region?: NetworkRegion; onRegionChange?(region: NetworkRegion): void; boundary: DecisionBoundaryController; selection: NetworkSelectionController; onSetup(tab: SetupTab): void; onResults(): void }) {
+export function AtelierNetwork({ layout, region, onRegionChange, prediction, graph, onSetup, onResults }: AtelierNetworkProps) {
+    const compact = layout === 'compact';
+    const showData = !compact || region === 'data';
+    const showNetwork = !compact || region === 'network';
+    const showPrediction = !compact || region === 'prediction';
+    const panelProps = (id: NetworkRegion) => compact ? { ...tabPanelProps(NETWORK_PANEL_PREFIX, id), tabIndex: 0 } : undefined;
+    const selectionDetail = graph.model.kind === 'selected' && <div className="atelier-neuron-detail"><NetworkSelectionDeck model={graph.model} onClear={graph.commands.clearSelection} /></div>;
+    const dataPanel = <section key="data" {...panelProps('data')} className="atelier-network-data" hidden={!showData}>
+        <div className="atelier-section-title"><h2>Data</h2><button type="button" onClick={() => onSetup('dataset')} aria-label="Edit dataset"><Icon name="settings" /></button></div>
+        {showData && <DataPlot />}
+    </section>;
+    const networkPanel = <section key="network" {...panelProps('network')} className="atelier-network-model" hidden={!showNetwork}>
+        <div className="atelier-section-title"><h2>Network</h2><button type="button" onClick={() => onSetup('network')}>Edit layers <Icon name="next" size={14} /></button></div>
+        <div className="atelier-network-graph">{showNetwork && <NetworkGraph selectionController={graph} />}</div>
+        {compact && showNetwork && selectionDetail}
+    </section>;
     return <>
-        {compact && <Tabs label="Network regions" items={[{id:'data',label:'Data'},{id:'network',label:'Network'},{id:'prediction',label:'Prediction'}]} value={region} onChange={(value) => onRegionChange?.(value)} />}
-        <div className="atelier-network">
-            <section className="atelier-network-data" hidden={compact && region !== 'data'}><div className="atelier-section-title"><h2>Data</h2><button type="button" onClick={() => onSetup('dataset')} aria-label="Edit dataset"><Icon name="settings" /></button></div>{(!compact || region === 'data') && <DataPlot />}</section>
-            <section className="atelier-network-model" hidden={compact && region !== 'network'}><div className="atelier-section-title"><h2>Network</h2><button type="button" onClick={() => onSetup('network')}>Edit layers <Icon name="next" size={14} /></button></div><div className="atelier-network-graph">{(!compact || region === 'network') && <NetworkGraph selectionController={selection} />}</div></section>
-            <section className="atelier-network-prediction" hidden={compact && region !== 'prediction'}><div className="atelier-section-title"><h2>Prediction</h2><button type="button" onClick={onResults} aria-label="Expand prediction results"><Icon name="expand" /></button></div>{(!compact || region === 'prediction') && <DecisionBoundaryCanvas model={boundary.model} />}<p className="atelier-plot-caption">{boundary.model.kind !== 'empty' && boundary.model.kind !== 'unavailable' && boundary.model.provenance && <span className="atelier-artifact-step">{`Grid at step ${boundary.model.provenance.model.step}.`}</span>}The model’s output across the input space. Select Results for evaluation and overlays.</p></section>
+        {compact && <Tabs panelPrefix={NETWORK_PANEL_PREFIX} label="Network regions" items={NETWORK_REGIONS} value={region} onChange={onRegionChange} />}
+        <div className="atelier-network" data-layout={layout}>
+            {layout === 'wide' ? [dataPanel, networkPanel] : [networkPanel, dataPanel]}
+            <section {...panelProps('prediction')} className="atelier-network-prediction" hidden={!showPrediction}>
+                <div className="atelier-section-title"><h2>Prediction</h2><button type="button" onClick={onResults} aria-label="Expand prediction results"><Icon name="expand" /></button></div>
+                {showPrediction && prediction}
+            </section>
         </div>
-        {selection.model.kind === 'selected' && (!compact || region === 'network') && <div className="atelier-neuron-detail"><NetworkSelectionDeck model={selection.model} onClear={selection.commands.clearSelection} /></div>}
+        {!compact && selectionDetail}
     </>;
 }

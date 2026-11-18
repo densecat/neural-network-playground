@@ -495,7 +495,7 @@ describe('GuidedLessonPanel', () => {
         expect(screen.getByText('Three-Class Softmax Lab')).toBeInTheDocument();
     });
 
-    it('ends at the exact lesson destination for all 70 catalog-source transitions', async () => {
+    it.each(PREPARED_PRESETS)('ends at each exact lesson destination starting from $id', async (source) => {
         const user = userEvent.setup();
         const viewResult = await usePlaygroundStore.getState().editView(() => ({
             showTestData: true,
@@ -507,52 +507,47 @@ describe('GuidedLessonPanel', () => {
         ));
         usePlaygroundStore.setState({ applyRecipe: canonicalApplyRecipe });
 
-        for (const source of PREPARED_PRESETS) {
-            for (const lesson of LESSON_DEFINITIONS) {
-                const sourceResult = await usePlaygroundStore.getState().applyRecipe(source);
-                expect(sourceResult.ok, `source ${source.id}`).toBe(true);
-                resetLayout();
-                resetTrainingTransactionState();
+        for (const lesson of LESSON_DEFINITIONS) {
+            const sourceResult = await usePlaygroundStore.getState().applyRecipe(source);
+            expect(sourceResult.ok, `source ${source.id}`).toBe(true);
+            resetLayout();
+            resetTrainingTransactionState();
 
-                const target = getLessonRecipe(lesson);
-                const onReset = vi.fn();
-                const onHighlightChange = vi.fn();
-                const { unmount } = render(
-                    <GuidedLessonPanel
-                        onReset={onReset}
-                        onHighlightChange={onHighlightChange}
-                    />,
-                );
-                await user.selectOptions(
-                    screen.getByRole('combobox', { name: 'Guided lesson' }),
-                    lesson.id,
-                );
-                await user.click(screen.getByRole('button', { name: 'Start lesson and reset' }));
+            const target = getLessonRecipe(lesson);
+            const onReset = vi.fn();
+            const onHighlightChange = vi.fn();
+            const { unmount } = render(
+                <GuidedLessonPanel
+                    onReset={onReset}
+                    onHighlightChange={onHighlightChange}
+                />,
+            );
+            await user.selectOptions(screen.getByRole('combobox', { name: 'Guided lesson' }), lesson.id);
+            await user.click(screen.getByRole('button', { name: 'Start lesson and reset' }));
 
-                await waitFor(() => {
-                    expect(
-                        currentPreparedForTest()?.identities.canonicalRecipeKey,
-                        `${source.id}@${source.revision} -> ${lesson.id} (${target.id}@${target.revision})`,
-                    ).toBe(target.prepared.identities.canonicalRecipeKey);
-                    // A source recipe can already match before asynchronous start finishes.
-                    expect(onReset).toHaveBeenCalledTimes(1);
-                });
-                expect(currentPreparedForTest()?.identities.recipeFingerprint)
-                    .toBe(target.prepared.identities.recipeFingerprint);
-                expect(currentPreparedForTest()?.document.view).toEqual({
-                    showTestData: true,
-                    discretizeOutput: true,
-                });
-                expect(onHighlightChange).toHaveBeenLastCalledWith(lesson.steps[0].target);
-                expect(useLayoutStore.getState()).toMatchObject({
-                    activeLessonId: lesson.id,
-                    activeLessonStepIndex: 0,
-                });
-                expect(canonicalApplyRecipe).toHaveBeenLastCalledWith(target);
+            await waitFor(() => {
+                expect(
+                    currentPreparedForTest()?.identities.canonicalRecipeKey,
+                    `${source.id}@${source.revision} -> ${lesson.id} (${target.id}@${target.revision})`,
+                ).toBe(target.prepared.identities.canonicalRecipeKey);
+                // A source recipe can already match before asynchronous start finishes.
+                expect(onReset).toHaveBeenCalledTimes(1);
+            });
+            expect(currentPreparedForTest()?.identities.recipeFingerprint)
+                .toBe(target.prepared.identities.recipeFingerprint);
+            expect(currentPreparedForTest()?.document.view).toEqual({
+                showTestData: true,
+                discretizeOutput: true,
+            });
+            expect(onHighlightChange).toHaveBeenLastCalledWith(lesson.steps[0].target);
+            expect(useLayoutStore.getState()).toMatchObject({
+                activeLessonId: lesson.id,
+                activeLessonStepIndex: 0,
+            });
+            expect(canonicalApplyRecipe).toHaveBeenLastCalledWith(target);
 
-                unmount();
-                useTrainingStore.getState().finishConfigChange();
-            }
+            unmount();
+            useTrainingStore.getState().finishConfigChange();
         }
     }, 30_000);
 

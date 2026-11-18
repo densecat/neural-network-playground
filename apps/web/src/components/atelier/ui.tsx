@@ -6,14 +6,30 @@ import { X, Play, Pause, StepForward, RotateCcw, Settings2, Sun, Moon, Monitor, 
 const icons = { close: X, play: Play, pause: Pause, step: StepForward, reset: RotateCcw, settings: Settings2, sun: Sun, moon: Moon, system: Monitor, more: Ellipsis, expand: ArrowUpRight, next: ChevronRight, history: History, book: BookOpen } satisfies Record<string, LucideIcon>;
 export function Icon({ name, size = 18 }: { name: keyof typeof icons; size?: number }) { const Component = icons[name]; return <Component size={size} strokeWidth={1.6} aria-hidden="true" focusable="false" />; }
 
-export function Tabs<T extends string>({ label, items, value, onChange, panelPrefix }: { label: string; items: readonly { id: T; label: string }[]; value: T; onChange(value: T): void; panelPrefix?: string }) {
+type TabItem<T extends string> = { id: T; label: string };
+
+export function tabPanelProps(prefix: string, id: string) {
+    return { role: 'tabpanel', id: `${prefix}-${id}`, 'aria-labelledby': `${prefix}-tab-${id}` } as const;
+}
+
+export function TabPanels<T extends string>({ panelPrefix, items, value, children, className, tabIndex }: { panelPrefix: string; items: readonly TabItem<T>[]; value: T; children: ReactNode; className?: string; tabIndex?: number }) {
+    return items.map(({ id }) => <div key={id} {...tabPanelProps(panelPrefix, id)} className={className} hidden={id !== value} tabIndex={tabIndex}>
+        {id === value && children}
+    </div>);
+}
+
+export function Tabs<T extends string>({ label, items, value, onChange, panelPrefix }: { label: string; items: readonly TabItem<T>[]; value: T; onChange(value: T): void; panelPrefix: string }) {
     const refs = useRef<Array<HTMLButtonElement | null>>([]);
     const key = (event: KeyboardEvent, index: number) => {
         const next = event.key === 'ArrowRight' ? (index + 1) % items.length : event.key === 'ArrowLeft' ? (index + items.length - 1) % items.length : event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1 : -1;
         if (next < 0) return;
         event.preventDefault(); event.stopPropagation(); refs.current[next]?.focus(); onChange(items[next].id);
     };
-    return <div className="atelier-tabs" role="tablist" aria-label={label}>{items.map((item, index) => <button key={item.id} ref={(node) => { refs.current[index] = node; }} type="button" role="tab" id={panelPrefix ? `${panelPrefix}-tab-${item.id}` : undefined} aria-controls={panelPrefix ? `${panelPrefix}-${item.id}` : undefined} aria-selected={value === item.id} tabIndex={value === item.id ? 0 : -1} onKeyDown={(event) => key(event, index)} onClick={() => onChange(item.id)}>{item.label}</button>)}</div>;
+    return <div className="atelier-tabs" role="tablist" aria-label={label}>{items.map((item, index) => {
+        const panel = tabPanelProps(panelPrefix, item.id);
+        const selected = value === item.id;
+        return <button key={item.id} ref={(node) => { refs.current[index] = node; }} type="button" role="tab" id={panel['aria-labelledby']} aria-controls={panel.id} aria-selected={selected} tabIndex={selected ? 0 : -1} onKeyDown={(event) => key(event, index)} onClick={() => onChange(item.id)}>{item.label}</button>;
+    })}</div>;
 }
 
 export function Dialog({ title, children, onClose, alert = false, description, persistent = false, backgroundRef }: { title: string; children: ReactNode; onClose(): void; alert?: boolean; description?: string; persistent?: boolean; backgroundRef?: RefObject<HTMLElement | null> }) {

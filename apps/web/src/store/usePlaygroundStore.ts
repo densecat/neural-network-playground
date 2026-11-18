@@ -56,16 +56,25 @@ type PrepareExperiment = (
 export interface PlaygroundStoreInitialization {
     prepare?: PrepareExperiment;
     access: ExperimentAccessState;
+    runRequestSource?: RunRequestSource;
 }
+
+type RunRequestSource = 'document' | 'saved-run' | 'url';
 
 export interface PlaygroundStore {
     access: ExperimentAccessState;
     preparation: PreparationState;
+    /** Changes when an explicit experiment replacement is published. */
+    runRequestId: number;
+    runRequestSource: RunRequestSource;
+    urlSyncNotice: string | null;
 
     featuresUI: FeaturesUI;
     demand: VisualizationDemand;
 
-    replaceDocument(value: unknown): Promise<SchemaResult<PreparedExperimentDocumentV2>>;
+    replaceDocument(value: unknown, source?: 'saved-run'): Promise<SchemaResult<PreparedExperimentDocumentV2>>;
+    acknowledgeRuntimeDocument(prepared: PreparedExperimentDocumentV2, publishAccess?: boolean): void;
+    restoreAcknowledgedDocument(prepared: PreparedExperimentDocumentV2): void;
     replaceImportedDocument(
         value: unknown,
         file: File,
@@ -96,6 +105,8 @@ const DEFAULT_FEATURES_UI: FeaturesUI = {
     canvasNetworkGraph: true,
     webgpuGrid: true,
 };
+
+const VIEW_FIELDS = ['showTestData', 'discretizeOutput'] as const;
 
 const NO_ACTIVE_DOCUMENT: readonly ExperimentSchemaIssue[] = Object.freeze([{
     code: 'invalid-field',
@@ -148,6 +159,7 @@ export async function initializePlaygroundStateFromHash(
     return {
         prepare,
         access: { status: 'ready', prepared: prepared.value },
+        runRequestSource: rawHash ? 'url' : 'document',
     };
 }
 
@@ -177,11 +189,14 @@ export function createPlaygroundStore(
     const initialAccess = initialization.access;
 
     let nextRequestId = 0;
+    let viewRevision = 0;
+    const viewFieldRevisions = { showTestData: 0, discretizeOutput: 0 };
     let latestCandidateDocument: ValidatedExperimentDocumentV2 | null =
         initialAccess.status === 'ready' ? initialAccess.prepared.document : null;
     let lastSuccessfulPrepared = initialAccess.status === 'ready'
         ? initialAccess.prepared
         : null;
+    let acknowledgedDocument: PreparedExperimentDocumentV2 | null = null;
 
     return create<PlaygroundStore>((set, get) => {
         const markIncompatible = (
@@ -190,6 +205,7 @@ export function createPlaygroundStore(
         ): void => {
             const requestId = ++nextRequestId;
             latestCandidateDocument = null;
+            acknowledgedDocument = null;
             const boundedIssues = issues.length > 0 ? issues : NO_ACTIVE_DOCUMENT;
             set({
                 access: {
@@ -199,14 +215,17 @@ export function createPlaygroundStore(
                     issues: boundedIssues,
                 },
                 preparation: { status: 'error', requestId, issues: [] },
+                urlSyncNotice: null,
             });
         };
 
         const replace = async (
             value: unknown,
             failureSource: ExperimentInputSource | null = null,
+            source: RunRequestSource = 'document',
         ): Promise<SchemaResult<PreparedExperimentDocumentV2>> => {
             const requestId = ++nextRequestId;
+            const startingViewRevision = viewRevision;
             const candidateValidation = validateExperimentDocument(value);
             if (candidateValidation.ok) {
                 latestCandidateDocument = candidateValidation.value;
@@ -223,6 +242,7 @@ export function createPlaygroundStore(
             if (!result.ok) {
                 if (failureSource) {
                     latestCandidateDocument = null;
+                    acknowledgedDocument = null;
                     set({
                         access: {
                             status: 'incompatible',
@@ -231,6 +251,7 @@ export function createPlaygroundStore(
                             issues: result.issues,
                         },
                         preparation: { status: 'error', requestId, issues: [] },
+                        urlSyncNotice: null,
                     });
                 } else {
                     latestCandidateDocument = lastSuccessfulPrepared?.document ?? null;
@@ -241,13 +262,25 @@ export function createPlaygroundStore(
                 return result;
             }
 
-            lastSuccessfulPrepared = result.value;
-            latestCandidateDocument = result.value.document;
+            let prepared = result.value;
+            if (startingViewRevision !== viewRevision && lastSuccessfulPrepared) {
+                const view = { ...prepared.document.view };
+                for (const field of VIEW_FIELDS) {
+                    if (viewFieldRevisions[field] > startingViewRevision) {
+                        view[field] = lastSuccessfulPrepared.document.view[field];
+                    }
+                }
+                prepared = { ...prepared, document: { ...prepared.document, view } };
+            }
+            lastSuccessfulPrepared = prepared;
+            latestCandidateDocument = prepared.document;
             set({
-                access: { status: 'ready', prepared: result.value },
+                access: { status: 'ready', prepared },
                 preparation: { status: 'ready', requestId, issues: [] },
+                runRequestId: requestId,
+                runRequestSource: source,
             });
-            return result;
+            return { ok: true, value: prepared };
         };
 
         const editRecipe = async (
@@ -265,9 +298,31 @@ export function createPlaygroundStore(
                 view: ValidatedExperimentDocumentV2['view'],
             ) => ExperimentDocumentV2['view'],
         ): Promise<SchemaResult<PreparedExperimentDocumentV2>> => {
-            const base = latestCandidateDocument;
-            if (!base) return unavailableResult(get().preparation.issues);
-            return replace({ ...base, view: edit(base.view) });
+            const { access } = get();
+            if (access.status !== 'ready') return unavailableResult(access.issues);
+            const current = access.prepared;
+            const validation = validateExperimentDocument({
+                ...current.document,
+                view: edit(current.document.view),
+            });
+            if (!validation.ok) return validation;
+            const { view } = validation.value;
+            const changedFields = VIEW_FIELDS.filter((field) => view[field] !== current.document.view[field]);
+            if (changedFields.length === 0) return { ok: true, value: current };
+            const prepared = { ...current, document: { ...current.document, view } };
+            viewRevision++;
+            lastSuccessfulPrepared = prepared;
+            const candidateView = { ...(latestCandidateDocument?.view ?? view) };
+            for (const field of changedFields) {
+                viewFieldRevisions[field] = viewRevision;
+                candidateView[field] = view[field];
+            }
+            if (latestCandidateDocument) {
+                latestCandidateDocument = { ...latestCandidateDocument, view: candidateView };
+            }
+            set({ access: { status: 'ready', prepared } });
+            get().syncToUrl();
+            return { ok: true, value: prepared };
         };
 
         const applyRecipe = async (
@@ -294,22 +349,46 @@ export function createPlaygroundStore(
             });
         };
 
+        const restoreAcknowledgedDocument = (prepared: PreparedExperimentDocumentV2): void => {
+            const { access, preparation } = get();
+            if (access.status !== 'ready') return;
+            // A display edit is independent of the worker's scientific recipe.
+            const current = access.prepared;
+            const restored = current.identities === prepared.identities ? current : {
+                ...prepared,
+                document: { ...prepared.document, view: current.document.view },
+            };
+            acknowledgedDocument = restored;
+            lastSuccessfulPrepared = restored;
+            if (preparation.status !== 'preparing') latestCandidateDocument = restored.document;
+            if (restored !== current) set({ access: { status: 'ready', prepared: restored } });
+        };
+
         return {
             access: initialAccess,
             preparation: initialAccess.status === 'ready'
                 ? { status: 'ready', requestId: 0, issues: [] }
                 : { status: 'error', requestId: 0, issues: [] },
+            runRequestId: 0,
+            runRequestSource: initialization.runRequestSource ?? 'document',
+            urlSyncNotice: null,
             featuresUI: { ...DEFAULT_FEATURES_UI },
             demand: { ...DEFAULT_DEMAND },
 
-            replaceDocument: (value) => replace(value),
+            replaceDocument: (value, source) => replace(value, null, source),
+            acknowledgeRuntimeDocument: (prepared, publishAccess = false) => {
+                acknowledgedDocument = prepared;
+                if (publishAccess) restoreAcknowledgedDocument(prepared);
+            },
+            restoreAcknowledgedDocument,
             replaceImportedDocument: (value, file) => replace(value, { kind: 'file', file }),
             markIncompatible,
             startFresh: async () => {
+                const requestId = nextRequestId + 1;
                 const result = await replace(DEFAULT_EXPERIMENT_DOCUMENT);
                 if (result.ok) {
-                    const access = get().access;
-                    if (access.status !== 'ready' || access.prepared !== result.value) {
+                    const { access, runRequestId } = get();
+                    if (access.status !== 'ready' || runRequestId !== requestId) {
                         return {
                             ok: false,
                             issues: [{
@@ -319,8 +398,8 @@ export function createPlaygroundStore(
                             }],
                         };
                     }
-                    const hash = encodeExperimentUrl(result.value.document);
-                    window.history.replaceState(null, '', hash);
+                    get().syncToUrl();
+                    return { ok: true, value: access.prepared };
                 }
                 return result;
             },
@@ -330,10 +409,19 @@ export function createPlaygroundStore(
             syncToUrl: () => {
                 const access = get().access;
                 if (access.status !== 'ready') return unavailableResult(access.issues);
-                const prepared = access.prepared;
-                const hash = encodeExperimentUrl(prepared.document);
-                window.history.replaceState(null, '', hash);
-                return { ok: true, value: hash };
+                try {
+                    const displayed = access.prepared.document;
+                    const hash = encodeExperimentUrl(acknowledgedDocument
+                        ? { ...acknowledgedDocument.document, view: displayed.view }
+                        : displayed);
+                    window.history.replaceState(null, '', hash);
+                    if (get().urlSyncNotice !== null) set({ urlSyncNotice: null });
+                    return { ok: true, value: hash };
+                } catch {
+                    const message = 'The setup link could not be updated. Retry to update the link.';
+                    if (get().urlSyncNotice !== message) set({ urlSyncNotice: message });
+                    return { ok: false, issues: [{ code: 'invalid-field', path: '$', message }] };
+                }
             },
             loadFromUrl: async () => {
                 const raw = getRawExperimentHash(window.location.href);
@@ -342,7 +430,7 @@ export function createPlaygroundStore(
                     markIncompatible({ kind: 'url', rawHash: raw }, decoded.issues);
                     return decoded;
                 }
-                return replace(decoded.value, { kind: 'url', rawHash: raw });
+                return replace(decoded.value, { kind: 'url', rawHash: raw }, 'url');
             },
 
             setDemand: (demand) => set({ demand }),

@@ -15,6 +15,7 @@ import {
     validateExperimentDocument,
 } from './experimentSchema.js';
 import { createStableJsonSnapshot } from './canonicalJson.js';
+import type { SessionCheckpoint } from './sessionCheckpoint.js';
 import {
     parseArtifactProvenance,
     parseLiveTrainingSignal,
@@ -101,12 +102,20 @@ export interface RestoreCheckpointRequestV2 {
     readonly checkpointId: number;
 }
 
+export interface BranchCheckpointRequestV2 extends Omit<RestoreCheckpointRequestV2, 'type'> {
+    readonly type: 'branch-checkpoint';
+    readonly trainingSteps?: number;
+}
+
+export const MAX_CHECKPOINT_BRANCH_STEPS = 10_000;
+
 export type MainToWorkerRequestV2 =
     | WorkerExperimentRequestV2
     | ForceEvaluationRequestV2
     | CaptureRunRequestV2
     | CaptureCheckpointRequestV2
-    | RestoreCheckpointRequestV2;
+    | RestoreCheckpointRequestV2
+    | BranchCheckpointRequestV2;
 
 export interface WorkerArtifactProvenanceV2 {
     readonly confusionMatrix?: ArtifactProvenance;
@@ -340,14 +349,29 @@ export function isCaptureCheckpointRequestV2(
 export function isRestoreCheckpointRequestV2(
     value: unknown,
 ): value is RestoreCheckpointRequestV2 {
-    return hasExactOwnKeys(
-        value,
-        ['type', 'protocolVersion', 'requestId', 'checkpointId'],
-    )
+    return hasExactOwnKeys(value, ['type', 'protocolVersion', 'requestId', 'checkpointId'])
         && value['type'] === 'restore-checkpoint'
         && value['protocolVersion'] === WORKER_PROTOCOL_VERSION
         && isRequestId(value['requestId'])
         && isRequestId(value['checkpointId']);
+}
+
+function isBranchCheckpointRequestV2(value: unknown): value is BranchCheckpointRequestV2 {
+    return hasExactOwnKeys(
+        value,
+        ['type', 'protocolVersion', 'requestId', 'checkpointId'],
+        ['trainingSteps'],
+    )
+        && value['type'] === 'branch-checkpoint'
+        && value['protocolVersion'] === WORKER_PROTOCOL_VERSION
+        && isRequestId(value['requestId'])
+        && isRequestId(value['checkpointId'])
+        && (!('trainingSteps' in value) || isCheckpointBranchStepCount(value['trainingSteps']));
+}
+
+export function isCheckpointBranchStepCount(value: unknown): value is number {
+    return typeof value === 'number'
+        && Number.isSafeInteger(value) && value > 0 && value <= MAX_CHECKPOINT_BRANCH_STEPS;
 }
 
 const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
@@ -391,7 +415,8 @@ export function parseMainToWorkerRequestV2(value: unknown): MainToWorkerRequestV
         || isForceEvaluationRequestV2(snapshot)
         || isCaptureRunRequestV2(snapshot)
         || isCaptureCheckpointRequestV2(snapshot)
-        || isRestoreCheckpointRequestV2(snapshot)) {
+        || isRestoreCheckpointRequestV2(snapshot)
+        || isBranchCheckpointRequestV2(snapshot)) {
         return snapshot as MainToWorkerRequestV2;
     }
     throw new TypeError('main-to-worker request: invalid version-2 request');
@@ -810,7 +835,7 @@ function isCheckpointSummary(value: unknown): value is CheckpointSummary {
     if (!hasExactOwnKeys(
         value,
         ['id', 'step', 'epoch', 'trainDataLoss', 'testDataLoss', 'label'],
-        ['trainAccuracy', 'testAccuracy'],
+        ['trainAccuracy', 'testAccuracy', 'trajectoryGuarantee'],
     )) return false;
     return (
         isPositiveInteger(value['id']) &&
@@ -822,6 +847,9 @@ function isCheckpointSummary(value: unknown): value is CheckpointSummary {
         (value['trainAccuracy'] === undefined || (value['trainAccuracy'] >= 0 && value['trainAccuracy'] <= 1)) &&
         isOptionalFiniteNumber(value['testAccuracy']) &&
         (value['testAccuracy'] === undefined || (value['testAccuracy'] >= 0 && value['testAccuracy'] <= 1)) &&
+        (!('trajectoryGuarantee' in value)
+            || value['trajectoryGuarantee'] === 'parameters-and-optimizer-only'
+            || value['trajectoryGuarantee'] === 'same-recipe-training-trajectory') &&
         typeof value['label'] === 'string' &&
         value['label'].length > 0 &&
         value['label'].length <= 120
@@ -839,7 +867,7 @@ function assertCheckpointTimelineV2Snapshot(value: unknown): asserts value is Ch
         'evictedCount',
         'liveCheckpointId',
         'restoredCheckpointId',
-    ])) {
+    ], ['branch'])) {
         throw new TypeError('checkpoint timeline must contain exactly the version-2 metadata fields');
     }
     if (value['maxCheckpoints'] !== 8) {
@@ -870,6 +898,25 @@ function assertCheckpointTimelineV2Snapshot(value: unknown): asserts value is Ch
     if (value['restoredCheckpointId'] !== null
         && !ids.includes(value['restoredCheckpointId'])) {
         throw new TypeError('checkpoint timeline restoredCheckpointId must be present in checkpoints');
+    }
+    if ('branch' in value) {
+        const branch = value['branch'];
+        if (!hasExactOwnKeys(branch, ['sourceCheckpointId', 'previousCheckpointId'], ['targetStep'])
+            || !isPositiveInteger(branch['sourceCheckpointId'])
+            || !isPositiveInteger(branch['previousCheckpointId'])
+            || value['restoredCheckpointId'] !== null) {
+            throw new TypeError('checkpoint timeline branch must identify its source and previous checkpoints');
+        }
+        const source = value['checkpoints'].find(({ id }) => id === branch['sourceCheckpointId']);
+        const previous = value['checkpoints'].find(({ id }) => id === branch['previousCheckpointId']);
+        if (source?.trajectoryGuarantee !== 'same-recipe-training-trajectory'
+            || previous?.trajectoryGuarantee !== 'same-recipe-training-trajectory') {
+            throw new TypeError('checkpoint timeline branch requires reproducible checkpoints');
+        }
+        if ('targetStep' in branch && (!isPositiveInteger(branch['targetStep'])
+            || !isCheckpointBranchStepCount(branch['targetStep'] - source.step))) {
+            throw new TypeError('checkpoint timeline branch targetStep must be within its training budget');
+        }
     }
 }
 
@@ -1299,6 +1346,7 @@ export interface CheckpointSummary {
     testDataLoss: number;
     trainAccuracy?: number;
     testAccuracy?: number;
+    trajectoryGuarantee?: SessionCheckpoint['trajectoryGuarantee'];
     label: string;
 }
 
@@ -1308,6 +1356,11 @@ export interface CheckpointTimeline {
     evictedCount: number;
     liveCheckpointId: number | null;
     restoredCheckpointId: number | null;
+    branch?: {
+        readonly sourceCheckpointId: number;
+        readonly previousCheckpointId: number;
+        readonly targetStep?: number;
+    };
 }
 
 export interface WorkerStatusMessage {

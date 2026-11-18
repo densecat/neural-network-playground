@@ -41,25 +41,25 @@ button:disabled {cursor:not-allowed;opacity:.48}
 .atelier button,.atelier-dialog button,.atelier select,.atelier-dialog select {color:inherit}
 .atelier button:not(.btn):where(:not(.saved-primary)),.atelier-dialog button:not(.btn) {border:1px solid var(--border-color);border-radius:3px;padding:8px 14px;background:transparent}
 .atelier .atelier-primary,.atelier-dialog .atelier-primary,.atelier .atelier-action {background:var(--action-bg)!important;color:var(--action-text)!important;border-color:var(--action-bg)!important;font-weight:600}
- .atelier-header {position:static;top:0;z-index:30;background:var(--bg-primary);min-height:88px;display:flex;align-items:center;gap:48px;padding:16px max(24px,calc((100vw - 1440px)/2));border-bottom:1px solid var(--border-color)}
+ .atelier-header {position:static;top:0;z-index:30;background:var(--bg-primary);min-height:88px;display:flex;flex-wrap:wrap;align-items:center;gap:48px;padding:16px max(24px,calc((100vw - 1440px)/2));border-bottom:1px solid var(--border-color)}
 .atelier-header .atelier-wordmark {font-family:var(--font-mono);font-size:23px;font-weight:700;letter-spacing:-1px;border:0;padding:0;white-space:nowrap}
 .atelier-wordmark span {color:var(--color-primary)}
-.atelier-header nav,.atelier-header-end {display:flex;align-items:center;gap:24px}
+.atelier-header nav,.atelier-header-end {display:flex;flex-wrap:wrap;align-items:center;gap:24px;max-width:100%}
 .atelier-header nav button,.atelier-header .atelier-lessons-link {border:0;padding:8px 0;color:var(--text-secondary)}
 .atelier-header nav button[aria-current],.atelier-header .atelier-lessons-link[aria-current] {color:var(--text-primary)}
-.atelier-header-end {margin-left:auto}
+.atelier-header-end {margin-left:auto;justify-content:flex-end}
 .atelier-theme {display:flex;align-items:center;gap:6px;font-size:14px}
 .atelier-theme select {background:var(--bg-primary);color:inherit;border:0;height:44px;min-height:44px;padding:0 8px}
 .atelier-menu {position:relative}
 .atelier .atelier-icon-button,.atelier-dialog .atelier-icon-button {display:inline-flex;align-items:center;justify-content:center;width:44px;flex-shrink:0;padding:8px}
-.atelier-menu-items {position:absolute;right:0;top:calc(100% + 8px);z-index:40;min-width:230px;padding:8px;border:1px solid var(--border-color);background:var(--bg-primary);box-shadow:0 8px 24px #0002}
+.atelier-menu-items {position:absolute;right:0;top:calc(100% + 8px);z-index:40;width:min(230px,calc(var(--atelier-viewport-width,100vw) - 32px));padding:8px;border:1px solid var(--border-color);background:var(--bg-primary);box-shadow:0 8px 24px #0002}
 .atelier-menu-items button {display:block;width:100%;text-align:left;border:0!important}
 .atelier-menu-items button:hover {background:var(--bg-secondary)!important}
 .atelier-main {max-width:1440px;margin:0 auto;padding:24px 32px 24px;min-width:0}
 .atelier-heading {display:flex;justify-content:space-between;align-items:center;gap:24px;margin-bottom:20px}
 .atelier-heading h1 {font-size:32px;line-height:1.2;font-weight:550;letter-spacing:-1px;margin:0 0 8px}
 .atelier-heading p {color:var(--text-secondary);margin:0}
-.atelier-heading-actions {display:flex;align-items:center;gap:12px}
+.atelier-heading-actions {display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .atelier-eyebrow {font-size:14px;letter-spacing:.1em;text-transform:uppercase;color:var(--text-secondary)}
 .atelier-tabs {display:flex;gap:32px;overflow-x:auto;border-bottom:1px solid var(--border-color);margin:0 0 20px}
 .atelier-tabs button {position:relative;white-space:nowrap;border:0!important;border-radius:0!important;padding:12px 0!important;color:var(--text-secondary)!important;flex-shrink:0}
@@ -71,13 +71,24 @@ button:disabled {cursor:not-allowed;opacity:.48}
 .atelier-section-title button {border:0!important;padding:0 8px!important;color:var(--text-secondary)!important;font-size:14px}
 .atelier-network {display:grid;grid-template-columns:minmax(180px,.85fr) minmax(360px,2.3fr) minmax(220px,1fr);gap:32px;align-items:start}
 .atelier-network>section {min-width:0}
+.atelier-network[data-layout="stacked"] {grid-template-columns:repeat(2,minmax(0,1fr));gap:24px}
+.atelier-network[data-layout="stacked"] .atelier-network-model {grid-column:1/-1}
+.atelier-network[data-layout="stacked"] .atelier-network-graph {height:520px}
+.atelier-network[data-layout="stacked"] .atelier-data-plot,.atelier-network[data-layout="stacked"] .decision-boundary {max-width:320px;margin:0 auto}
+.atelier-network[data-layout="compact"] {display:grid;grid-template-columns:minmax(0,1fr);gap:24px}
+.atelier-network[data-layout="compact"] .atelier-network-graph {height:540px}
 .atelier-data-plot {display:block;width:100%;height:auto;aspect-ratio:1;border:1px solid var(--border-color);background:var(--bg-secondary)}
+.atelier-plot-state {display:grid;place-items:center;text-align:center;padding:12px;color:var(--text-secondary)}
 .atelier-plot-caption {font-size:14px;line-height:1.6;color:var(--text-secondary);margin:12px 0}
 .atelier-class-legend {display:flex;flex-wrap:wrap;gap:12px;font-size:14px;color:var(--text-secondary);margin-top:12px}
 .atelier-class-legend span {display:flex;align-items:center;gap:6px}
 .atelier-class-legend i {width:7px;height:7px;border-radius:50%;background:var(--class-color)}
 .atelier-network-graph {height:560px;min-width:0}
 .atelier-network .network-graph-container {height:100%;min-height:0}
+.network-graph-container {display:grid;grid-template-rows:auto minmax(0,1fr);min-width:0}
+.network-graph-layer-labels {position:relative;overflow:clip;height:28px;line-height:28px;color:var(--text-secondary);font-size:12px;font-weight:600}
+.network-graph-layer-labels>span {position:absolute;translate:-50% 0;white-space:nowrap}
+.network-graph-plot {position:relative;min-width:0;min-height:0;overflow:clip}
 .atelier-network .network-graph-summary {position:static;max-height:88px;overflow:auto;padding:8px 0;font-size:14px}
 .atelier-neuron-detail {border-top:1px solid var(--border-color);margin-top:24px;padding-top:24px}
 .atelier-neuron-detail .precision-selection-details {display:grid;grid-template-columns:220px 1fr 1fr;gap:20px}
@@ -116,8 +127,6 @@ button:disabled {cursor:not-allowed;opacity:.48}
 .atelier-lesson-host {margin-top:24px;border-top:1px solid var(--border-color);padding-top:24px}
 @container atelier (max-width:1199px) {
  .atelier-header {gap:28px;padding:12px 24px}.atelier-header nav,.atelier-header-end {gap:16px}
- .atelier-network {grid-template-columns:1fr 1fr;gap:24px}.atelier-network>section:nth-child(2) {grid-column:1/-1;grid-row:2}
- .atelier-network .atelier-network-graph {height:520px}.atelier-network .atelier-data-plot,.atelier-network .decision-boundary-container {max-width:320px;margin:0 auto}
  .atelier-main {padding:32px 24px 20px}
 }
 @container atelier (max-width:759px) {
@@ -127,8 +136,6 @@ button:disabled {cursor:not-allowed;opacity:.48}
  .atelier-heading {align-items:flex-start;margin-bottom:8px;gap:12px;flex-wrap:wrap}.atelier-heading h1 {font-size:24px}.atelier-heading p {display:none}
  .atelier-heading-actions {flex-direction:row;align-items:center;gap:8px}.atelier-heading-actions button {font-size:14px;padding:8px!important}
  .atelier-tabs {gap:28px;margin-bottom:12px}.atelier-tabs button {font-size:14px}
- .atelier-network {display:flex;flex-direction:column;gap:24px}.atelier-network>section {width:100%}.atelier-network>section:first-child {order:1}.atelier-network>section:nth-child(2) {order:2}.atelier-network>section:last-child {order:3}
- .atelier-network-graph {height:540px!important}.atelier-network .atelier-data-plot {max-width:100%}
  .atelier-transport {padding:8px 0;margin:0 0 8px}.atelier-transport-row {gap:8px}.atelier-transport-row button {padding:8px!important}.atelier-transport-row label {margin-left:0}.atelier-transport-position {width:100%;margin-left:0;justify-content:space-between;gap:12px}
  .atelier-metrics {grid-template-columns:repeat(2,minmax(0,1fr));gap:24px 16px}.atelier-metrics dd {font-size:24px}
  .atelier-results-boundary {grid-template-columns:1fr;gap:24px}.atelier-evidence .chart-container {height:300px}
@@ -181,8 +188,6 @@ button:disabled {cursor:not-allowed;opacity:.48}
  .atelier-main[data-guided]>.atelier-workspace-layout {display:grid;grid-template-columns:minmax(0,1fr) 320px;gap:24px;align-items:start}
  .atelier-main[data-guided] .atelier-workspace {grid-column:1}
  .atelier-main[data-guided] .atelier-workspace-layout>.atelier-lesson-host {grid-column:2;margin:0;padding:0;border:0;align-self:start}
- .atelier-main[data-guided] .atelier-network {grid-template-columns:1fr 1fr}
- .atelier-main[data-guided] .atelier-network>section:nth-child(2) {grid-column:1/-1;grid-row:2}
 }
 
 .atelier-workspace>.atelier-tabs {background:var(--bg-primary)}
@@ -191,7 +196,7 @@ button:disabled {cursor:not-allowed;opacity:.48}
 .atelier[data-short-viewport] .atelier-transport,.atelier[data-short-viewport] .atelier-header {position:static}
 .atelier[data-short-viewport] .atelier-workspace>.atelier-tabs {top:0}
 
-.atelier-artifact-step {display:block;min-height:1.6em;font-variant-numeric:tabular-nums}
+.atelier-artifact-step {display:block;min-height:1lh;font-variant-numeric:tabular-nums;white-space:nowrap}
 .atelier-transport-position>div {display:flex;align-items:center;gap:4px}
 .atelier-transport-position strong {display:inline-block;min-width:6ch;font-variant-numeric:tabular-nums}
 @container atelier (max-width:759px) {
@@ -215,7 +220,7 @@ button:disabled {cursor:not-allowed;opacity:.48}
 .atelier-concepts details>div {padding:8px 0}
 
 .atelier-invitation {padding:4px 12px;gap:8px;margin-bottom:16px}.atelier-invitation p {margin:0}.atelier-invitation button {font-size:14px}
-@container atelier (max-width:759px) {.atelier-invitation {gap:4px 12px}.atelier-invitation p {flex-basis:auto}.atelier-heading-actions {display:none}.atelier-setup-footer button {flex:1}.atelier-setup-footer p {font-size:12px!important}}
+@container atelier (max-width:759px) {.atelier-invitation {gap:4px 12px}.atelier-invitation p {flex-basis:auto}.atelier-setup-footer button {flex:1}.atelier-setup-footer p {font-size:12px!important}}
 
 .atelier-results-errors { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--space-xl); align-items: start; }
 .atelier-error-map { min-width: 0; }
@@ -227,5 +232,5 @@ button:disabled {cursor:not-allowed;opacity:.48}
 
 @media (forced-colors: active) {
   .decision-boundary__swatch, .atelier-class-legend i, .atelier-data-plot circle, .network-graph-legend__swatch {forced-color-adjust:none}
-  .network-graph-container > canvas, .network-graph-container > svg {forced-color-adjust:none;background:var(--bg-primary);color:var(--text-secondary)}
+  .network-graph-plot > canvas, .network-graph-plot > svg {forced-color-adjust:none;background:var(--bg-primary);color:var(--text-secondary)}
 }

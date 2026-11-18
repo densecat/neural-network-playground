@@ -19,9 +19,10 @@
     "lint": "eslint .",
     "clean": "pnpm -r exec rm -rf dist node_modules"
   },
+  "packageManager": "pnpm@9.15.9",
   "engines": {
-    "node": ">=20",
-    "pnpm": ">=9"
+    "node": "^20.19.0 || ^22.13.0 || >=24",
+    "pnpm": "9.x"
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.10.2",

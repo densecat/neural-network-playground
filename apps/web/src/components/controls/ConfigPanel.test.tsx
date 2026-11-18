@@ -340,6 +340,22 @@ describe('ConfigPanel strict V2 transport', () => {
         expect(await screen.findByText(/Imported setup applied/)).toBeInTheDocument();
     });
 
+    it('keeps the import pending while the display view changes before worker acknowledgement', async () => {
+        render(<ConfigPanel onReset={vi.fn()} />);
+        const { document } = await stageSetup();
+        fireEvent.click(screen.getByRole('button', { name: 'Apply imported setup' }));
+        await waitFor(() => expect(currentPrepared()?.document).toEqual(document));
+
+        await act(async () => {
+            await usePlaygroundStore.getState().editView((view) => ({ ...view, showTestData: !view.showTestData }));
+        });
+
+        expect(screen.queryByText(/active setup changed/i)).not.toBeInTheDocument();
+        expect(useTrainingStore.getState().pendingConfigSource).toBe('setup');
+        acknowledge();
+        expect(await screen.findByText(/Imported setup applied/)).toBeInTheDocument();
+    });
+
     it('cancel leaves the active recipe untouched', async () => {
         render(<ConfigPanel onReset={vi.fn()} />);
         const { before } = await stageSetup();

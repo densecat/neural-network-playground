@@ -155,6 +155,18 @@ async function fakeStrictResultForRequest(
     };
 }
 
+function fakeDatasetPointsForRun(runId: number) {
+    const dataset = useTrainingStore.getState().latestEvaluation?.dataset;
+    if (!dataset) throw new Error('integration fixture requires committed dataset identity');
+    const point = { x: 0, y: 0, label: 0 };
+    return {
+        runId,
+        dataset,
+        trainPoints: Array.from({ length: dataset.trainCount }, () => point),
+        testPoints: Array.from({ length: dataset.testCount }, () => point),
+    };
+}
+
 const fakeWorkerApi = {
     initializeExperimentV2: vi.fn(),
     resetExperimentV2: vi.fn(),
@@ -166,8 +178,7 @@ const fakeWorkerApi = {
         liveCheckpointId: null,
         restoredCheckpointId: null,
     }),
-    getTrainPointsV2: vi.fn().mockResolvedValue([]),
-    getTestPointsV2: vi.fn().mockResolvedValue([]),
+    getDatasetPointsV2: vi.fn(fakeDatasetPointsForRun),
     updateDemand: vi.fn().mockResolvedValue(undefined),
     setStreamPort: vi.fn().mockResolvedValue(undefined),
 };
@@ -222,8 +233,6 @@ describe('Training integration', () => {
             liveCheckpointId: null,
             restoredCheckpointId: null,
         });
-        fakeWorkerApi.getTrainPointsV2.mockResolvedValue([]);
-        fakeWorkerApi.getTestPointsV2.mockResolvedValue([]);
 
         resetFrameBuffer();
 
@@ -278,10 +287,10 @@ describe('Training integration', () => {
         await act(async () => {
             render(<App />);
         });
-        await waitFor(() => expect(fakeNewRunTo).toHaveBeenCalledWith(1));
+        await waitFor(() => expect(screen.getByRole('button', { name: 'Play training' })).toBeEnabled());
 
         await act(async () => {
-            fireEvent.click(screen.getByRole('button', { name: 'Start training' }));
+            fireEvent.click(screen.getByRole('button', { name: 'Play training' }));
         });
 
         expect(fakePostStreamCommand).toHaveBeenCalledWith({
@@ -296,11 +305,11 @@ describe('Training integration', () => {
         await act(async () => {
             render(<App />);
         });
-        await waitFor(() => expect(fakeNewRunTo).toHaveBeenCalledWith(1));
+        await waitFor(() => expect(screen.getByRole('button', { name: 'Play training' })).toBeEnabled());
 
         // Start training first
         await act(async () => {
-            fireEvent.click(screen.getByRole('button', { name: 'Start training' }));
+            fireEvent.click(screen.getByRole('button', { name: 'Play training' }));
         });
 
         fakePostStreamCommand.mockClear();
@@ -441,8 +450,6 @@ describe('Dataset switching scenario', () => {
                 (useTrainingStore.getState().evidenceGenerationId ?? 0) + 1,
             ),
         );
-        fakeWorkerApi.getTrainPointsV2.mockResolvedValue([]);
-        fakeWorkerApi.getTestPointsV2.mockResolvedValue([]);
         fakeWorkerApi.updateDemand.mockResolvedValue(undefined);
 
         resetFrameBuffer();

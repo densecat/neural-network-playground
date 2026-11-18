@@ -1,13 +1,18 @@
 import { fireEvent, render, screen } from '@testing-library/react';
-import { beforeEach, expect, it } from 'vitest';
+import { beforeEach, expect, it, vi } from 'vitest';
 import { useState } from 'react';
 import { ALL_FEATURES } from '@nn-playground/engine';
 import { DEFAULT_EXPERIMENT_DOCUMENT, PREPARED_PRESETS } from '@nn-playground/shared';
 import { useRecipeDraft, type SetupTab } from '../../../hooks/useRecipeDraft.ts';
 import { usePlaygroundStore } from '../../../store/usePlaygroundStore.ts';
 import { useTrainingStore } from '../../../store/useTrainingStore.ts';
+import * as datasetPreviewModel from '../../controls/datasetPreviewModel.ts';
 import { SetupEditor } from './SetupEditor.tsx';
-function Harness() { const controller=useRecipeDraft();const [tab,onTabChange]=useState<SetupTab>('dataset');return <SetupEditor {...{controller,tab,onTabChange}}/>; }
+function Harness({ initialTab = 'dataset' }: { initialTab?: SetupTab }) {
+    const controller = useRecipeDraft();
+    const [tab, onTabChange] = useState(initialTab);
+    return <SetupEditor {...{ controller, tab, onTabChange }} />;
+}
 beforeEach(async () => {await usePlaygroundStore.getState().replaceDocument(DEFAULT_EXPERIMENT_DOCUMENT);useTrainingStore.getState().finishConfigChange();useTrainingStore.setState({configError:null,configErrorSource:null});});
 it('retains one draft across tabs and cancels every pending section', () => {
     render(<Harness/>);
@@ -31,6 +36,35 @@ it('keeps thumbnails and the selected preview available at valid noise 75', () =
     expect(screen.getByRole('button', { name: 'Apply changes' })).toBeEnabled();
     expect(screen.queryByText('Preview unavailable')).not.toBeInTheDocument();
     expect(container.querySelectorAll('canvas')).toHaveLength(12);
+});
+
+it('generates the selected preview only when Data is visible and its inputs change', () => {
+    const preview = vi.spyOn(datasetPreviewModel, 'deriveDatasetPreviewModel');
+    const selectedCalls = () => preview.mock.calls.filter(([args]) => args.sampleCount !== undefined);
+    const { data, task } = DEFAULT_EXPERIMENT_DOCUMENT.recipe;
+    try {
+        render(<Harness initialTab="training" />);
+        fireEvent.change(screen.getByLabelText('Learning rate'), { target: { value: '0.02' } });
+        expect(selectedCalls()).toEqual([]);
+
+        fireEvent.click(screen.getByRole('button', { name: 'Data' }));
+        expect(selectedCalls()).toEqual([[
+            { datasetId: task.dataset, seed: data.seed, noise: data.noise, sampleCount: data.sampleCount },
+        ]]);
+        fireEvent.change(screen.getByLabelText('Train fraction (0.1–0.9)'), { target: { value: '0.8' } });
+        expect(selectedCalls()).toHaveLength(1);
+
+        fireEvent.change(screen.getByLabelText('Samples'), { target: { value: '100' } });
+        fireEvent.click(screen.getByRole('button', { name: 'XOR' }));
+        fireEvent.click(screen.getByRole('button', { name: 'Reshuffle seed' }));
+        fireEvent.change(screen.getByLabelText('Noise (%)'), { target: { value: '75' } });
+        expect(selectedCalls()).toHaveLength(5);
+        expect(selectedCalls().at(-1)).toEqual([
+            { datasetId: 'xor', seed: data.seed + 1, noise: 75, sampleCount: 100 },
+        ]);
+    } finally {
+        preview.mockRestore();
+    }
 });
 
 it('offers the complete canonical preset catalog as a cancellable local draft', () => {
@@ -107,6 +141,13 @@ it('exposes optimizer, schedule, penalty, clipping and regression loss parameter
     render(<Harness />);
     fireEvent.click(screen.getByRole('button', { name: 'Plane' }));
     fireEvent.click(screen.getByRole('button', { name: 'Training' }));
+    expect(screen.getByLabelText('Optimizer')).toHaveValue('sgd');
+    expect(screen.getByLabelText('Schedule')).toHaveValue('constant');
+    expect(screen.getByLabelText('Penalty')).toHaveValue('none');
+    expect(screen.getByLabelText('Clipping')).toHaveValue('none');
+    for (const label of ['Momentum', 'Beta 1', 'Beta 2', 'Epsilon', 'Interval (steps)', 'Gamma', 'Duration (steps)', 'Minimum rate', 'Coefficient', 'Maximum norm', 'Huber delta']) {
+        expect(screen.queryByLabelText(label)).not.toBeInTheDocument();
+    }
     fireEvent.change(screen.getByLabelText('Optimizer'), { target: { value: 'adam' } });
     expect(screen.getByLabelText('Epsilon')).toHaveValue('1e-8');
     fireEvent.change(screen.getByLabelText('Optimizer'), { target: { value: 'sgd-momentum' } });
@@ -126,6 +167,48 @@ it('exposes optimizer, schedule, penalty, clipping and regression loss parameter
     expect(screen.getByLabelText('Maximum norm')).toHaveValue('1');
     expect(screen.getByRole('button', { name: 'Apply changes' })).toBeEnabled();
     expect(useTrainingStore.getState().pendingConfigSource).toBeNull();
+});
+
+it.each([
+    {
+        name: 'step decay and momentum',
+        schedule: { kind: 'step', interval: 17, gamma: 0.63 },
+        optimizer: { kind: 'sgd-momentum', momentum: 0.81 },
+        gradientClipping: { kind: 'global-norm', maximumNorm: 2.5, scope: 'total-objective-gradient' },
+        fields: [['Interval (steps)', '17'], ['Gamma', '0.63'], ['Momentum', '0.81'], ['Maximum norm', '2.5']],
+    },
+    {
+        name: 'cosine decay and Adam',
+        schedule: { kind: 'cosine', totalSteps: 2500, minimumRate: 0.004 },
+        optimizer: { kind: 'adam', beta1: 0.81, beta2: 0.97, epsilon: 1e-8 },
+        gradientClipping: { kind: 'none' },
+        fields: [['Duration (steps)', '2500'], ['Minimum rate', '0.004'], ['Beta 1', '0.81'], ['Beta 2', '0.97'], ['Epsilon', '1e-8']],
+    },
+] as const)('loads exact recipe parameters for $name', async ({ schedule, optimizer, gradientClipping, fields }) => {
+    const base = PREPARED_PRESETS.find(({ id }) => id === 'regression-plane')!.prepared.document;
+    const result = await usePlaygroundStore.getState().replaceDocument({
+        ...base,
+        recipe: {
+            ...base.recipe,
+            training: { ...base.recipe.training, schedule, optimizer, gradientClipping },
+            objective: {
+                ...base.recipe.objective,
+                dataLoss: { kind: 'huber', delta: 1.75 },
+                penalty: { kind: 'l2', coefficient: 0.012, applyTo: 'weights' },
+            },
+        },
+    });
+    expect(result.ok).toBe(true);
+    useTrainingStore.getState().finishConfigChange();
+
+    render(<Harness initialTab="training" />);
+    expect(screen.getByLabelText('Schedule')).toHaveValue(schedule.kind);
+    expect(screen.getByLabelText('Optimizer')).toHaveValue(optimizer.kind);
+    expect(screen.getByLabelText('Clipping')).toHaveValue(gradientClipping.kind);
+    expect(screen.getByLabelText('Huber delta')).toHaveValue('1.75');
+    expect(screen.getByLabelText('Coefficient')).toHaveValue('0.012');
+    expect(screen.getByLabelText('Penalty')).toHaveDisplayValue('L2 (squared weights)');
+    for (const [label, value] of fields) expect(screen.getByLabelText(label)).toHaveValue(value);
 });
 
 it('steps neuron counts within the supported limits without applying the draft', () => {

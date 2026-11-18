@@ -31,7 +31,7 @@ describe('Signal Atelier production composition', () => {
         usePlaygroundStore.setState({ access: { status: 'ready', prepared }, preparation: { status: 'ready', requestId: 0, issues: [] } });
         useLayoutStore.setState({ destination:'playground',workspaceTab:'network',setupTab:'dataset',resultsTab:'boundary',inspectTab:'trace',activeLessonId:null,   audienceMode: 'explore',     codeExportTab: 'numpy', lessonCueDismissed: true });
         useTrainingStore.getState().resetEvidence();
-        useTrainingStore.setState({ status: 'paused', evidenceGenerationId: 7, paramsVersion: 1, neuronGridsVersion: 1, workerError: null, pendingConfigSource: null, trainedRecipe: prepared.document.recipe, trainedRecipeFingerprint: prepared.identities.recipeFingerprint });
+        useTrainingStore.setState({ status: 'paused', datasetStatus: 'ready', datasetError: null, evidenceGenerationId: 7, paramsVersion: 1, neuronGridsVersion: 1, workerError: null, pendingConfigSource: null, trainedRecipe: prepared.document.recipe, trainedRecipeFingerprint: prepared.identities.recipeFingerprint });
         useExperimentMemoryStore.setState({ hydrationStatus: 'ready', records: Object.freeze([]), rejectedRecords: Object.freeze([]), incompatibleEnvelope: null, pendingSave: null });
         const layers = [prepared.compiled.network.inputSize, ...prepared.compiled.network.hiddenLayers, prepared.compiled.network.outputSize];
         const count = layers.slice(1).reduce((sum, n) => sum + n, 0);

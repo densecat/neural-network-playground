@@ -53,10 +53,9 @@ for (const theme of ['light', 'dark'] as const) {
             if ([5, 11, 15, 16].includes(id)) await page.screenshot({ path: resolve(output, `${String(id).padStart(2, '0')}-${names[id - 1]}-${theme}-viewport.png`), animations: 'disabled' });
             await page.screenshot({ path: resolve(output, `${String(id).padStart(2, '0')}-${names[id - 1]}-${theme}.png`), fullPage, animations: 'disabled' });
             if ([2, 3, 4, 20].includes(id)) {
-                const fields = page.locator('.atelier-setup-fields');
-                await fields.evaluate((element) => { element.scrollTop = element.scrollHeight; });
+                await page.getByRole('button', { name: 'Apply changes', exact: true }).scrollIntoViewIfNeeded();
                 await page.screenshot({ path: resolve(output, `${String(id).padStart(2, '0')}-${names[id - 1]}-${theme}-controls.png`), animations: 'disabled' });
-                await fields.evaluate((element) => { element.scrollTop = 0; });
+                await page.evaluate(() => window.scrollTo(0, 0));
             }
             receipts.push({ id, name: names[id - 1], theme, url: page.url(), step: await transport(page).getAttribute('data-model-step'), viewport: page.viewportSize(), dimensions, fullPage });
             await writeFile(resolve(output, `capture-receipts-${theme}.json`), JSON.stringify(receipts, null, 2));

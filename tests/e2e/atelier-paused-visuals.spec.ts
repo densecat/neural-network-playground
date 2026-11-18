@@ -20,6 +20,6 @@ for (const recipe of ['Circle with One Hidden Layer', 'Three-Class Softmax Lab']
             await expect(node).toHaveAttribute('data-grid-available', 'true');
         }
         expect(await identity(page)).toEqual(before);
-        await expect(page.getByRole('button', { name: 'Start training' })).toBeVisible();
+        await expect(page.getByRole('button', { name: 'Play training' })).toBeVisible();
     });
 }

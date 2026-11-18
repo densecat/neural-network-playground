@@ -6,10 +6,10 @@ import { useEffect, useRef, useCallback } from 'react';
 import { usePlaygroundStore } from '../store/usePlaygroundStore.ts';
 import {
     useTrainingStore,
+    type RejectedConfigRequest,
     type TrainedRecipeSource,
-    type TrainingStore,
 } from '../store/useTrainingStore.ts';
-import { selectScientificEvidence } from '../store/evidenceSelectors.ts';
+import { selectCheckpointBranchComplete, selectScientificEvidence } from '../store/evidenceSelectors.ts';
 import {
     getWorkerApi,
     setupStreamChannel,
@@ -32,7 +32,6 @@ import {
     updateFrameBuffer,
     validateFrameBufferPatch,
     type FrameBufferPatch,
-    type FrameVersions,
 } from '../worker/frameBuffer.ts';
 import {
     flattenBiases,
@@ -46,6 +45,7 @@ import { getDatasetContract } from '@nn-playground/engine';
 import type {
     ArtifactProvenance,
     CheckpointTimeline,
+    DatasetRevision,
     PairedEvaluation,
     PreparedExperimentDocumentV2,
     WorkerEvidenceMessageV2,
@@ -57,16 +57,27 @@ import type {
 import {
     GRID_SIZE,
     WORKER_PROTOCOL_VERSION,
+    isCheckpointBranchStepCount,
     parseArtifactProvenance,
     parseWorkerEvidenceMessageV2,
     parseCheckpointTimelineV2,
 } from '@nn-playground/shared';
-import type { WorkerExperimentResultV2 } from '../worker/training.worker.ts';
+import type { WorkerDatasetPointsV2, WorkerExperimentResultV2 } from '../worker/training.worker.ts';
 
 type TrainingWorkerRemote = Awaited<ReturnType<typeof getWorkerApi>>;
 type InitializeExperimentResult = Awaited<
     ReturnType<TrainingWorkerRemote['initializeExperimentV2']>
 >;
+
+interface AcknowledgedRun {
+    readonly runId: number;
+    readonly owner: PreparedExperimentDocumentV2;
+    readonly source: TrainedRecipeSource;
+    readonly dataset: DatasetRevision;
+    readonly evidence: WorkerEvidenceMessageV2;
+    readonly framePatch: FrameBufferPatch;
+    readonly timeline: CheckpointTimeline;
+}
 
 export interface TrainingHook {
     play: () => void;
@@ -74,6 +85,7 @@ export interface TrainingHook {
     step: () => Promise<void>;
     reset: () => Promise<void>;
     restoreCheckpoint: (id: number) => Promise<void>;
+    branchCheckpoint: (id: number, trainingSteps?: number) => Promise<void>;
 }
 
 function getErrorMessage(error: unknown, fallback: string): string {
@@ -92,6 +104,37 @@ function requirePreparedExperiment(): PreparedExperimentDocumentV2 {
 function currentPreparedExperiment(): PreparedExperimentDocumentV2 | null {
     const access = usePlaygroundStore.getState().access;
     return access.status === 'ready' ? access.prepared : null;
+}
+
+function isCurrentRunRequest(runRequestId: number, prepared: PreparedExperimentDocumentV2): boolean {
+    const { access, runRequestId: currentRunRequestId } = usePlaygroundStore.getState();
+    return currentRunRequestId === runRequestId
+        && access.status === 'ready'
+        && access.prepared.identities === prepared.identities;
+}
+
+function isCompletePointSplit(points: DataPoint[], count: number): boolean {
+    if (!Array.isArray(points) || points.length !== count) return false;
+    for (const point of points) {
+        if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)
+            || !Number.isFinite(point.label)) return false;
+    }
+    return true;
+}
+
+function validateDatasetPoints(
+    response: WorkerDatasetPointsV2,
+    runId: number,
+    expected: DatasetRevision,
+): void {
+    const dataset = response?.dataset;
+    if (response?.runId !== runId || dataset?.datasetKey !== expected.datasetKey
+        || dataset?.generatorVersion !== expected.generatorVersion
+        || dataset?.trainCount !== expected.trainCount || dataset?.testCount !== expected.testCount
+        || !isCompletePointSplit(response.trainPoints, expected.trainCount)
+        || !isCompletePointSplit(response.testPoints, expected.testCount)) {
+        throw new Error('dataset points do not match the active experiment');
+    }
 }
 
 export function createWorkerExperimentRequestV2(
@@ -333,6 +376,7 @@ function preflightStrictV2Result(
         || checkpointTimeline.checkpoints[0]?.step !== 0
         || checkpointTimeline.liveCheckpointId !== checkpointTimeline.checkpoints[0]?.id
         || checkpointTimeline.restoredCheckpointId !== null
+        || checkpointTimeline.branch !== undefined
     )) {
         throw new Error('fresh direct V2 result requires one initial checkpoint summary');
     }
@@ -738,14 +782,6 @@ function buildStrictV2FramePatch(
     return patch;
 }
 
-function applyFreshV2SnapshotToStore(
-    ts: TrainingStore,
-    _result: WorkerExperimentResultV2,
-    frameVersions: FrameVersions,
-): void {
-    ts.setFrameVersions(frameVersions);
-}
-
 const EMPTY_CHECKPOINT_TIMELINE: CheckpointTimeline = {
     checkpoints: [],
     maxCheckpoints: 8,
@@ -759,12 +795,18 @@ export function useTraining(): TrainingHook {
     const mountedRef = useRef(true);
     const initializedRef = useRef(false);
     const activePreparedRef = useRef<PreparedExperimentDocumentV2 | null>(null);
-    const prevPreparedRef = useRef<PreparedExperimentDocumentV2 | null>(null);
-    const prevConfigSyncNonceRef = useRef(0);
+    const acknowledgedRunRef = useRef<AcknowledgedRun | null>(null);
+    const inFlightRunCommitsRef = useRef(new Map<number, Promise<void>>());
+    const prevRunRequestIdRef = useRef<number | null>(null);
+    const prevConfigSyncNonceRef = useRef(useTrainingStore.getState().configSyncNonce);
     const requestIdRef = useRef(0);
     const activeRequestIdRef = useRef<number | null>(null);
     const pendingPreparationRequestIdRef = useRef<number | null>(null);
     const rejectedPreparationRequestIdsRef = useRef(new Set<number>());
+    const configSyncRejectionRef = useRef<{
+        readonly requestId: number;
+        readonly reject: (message: string) => void;
+    } | null>(null);
     const lifecycleEpochRef = useRef(0);
     const streamSetupPromiseRef = useRef<Promise<void> | null>(null);
     const initializationPromiseRef = useRef<Promise<boolean> | null>(null);
@@ -776,14 +818,11 @@ export function useTraining(): TrainingHook {
     const isPlayingRef = useRef(false);
     const configSyncSeqRef = useRef(0);
     const activeConfigSyncSeqRef = useRef(0);
-    const configSyncPendingRef = useRef(false);
     const restoreBarrierRef = useRef<Promise<void> | null>(null);
     const e2eStartupFaultActiveRef = useRef(false);
 
     // Config selectors (from playground store — stable, rarely changes)
-    const prepared = usePlaygroundStore((s) => (
-        s.access.status === 'ready' ? s.access.prepared : null
-    ));
+    const runRequestId = usePlaygroundStore((s) => s.runRequestId);
     const demand = usePlaygroundStore((s) => s.demand);
     const webgpuGrid = usePlaygroundStore((s) => s.featuresUI.webgpuGrid);
 
@@ -811,17 +850,17 @@ export function useTraining(): TrainingHook {
         const seq = configSyncSeqRef.current + 1;
         configSyncSeqRef.current = seq;
         activeConfigSyncSeqRef.current = seq;
-        configSyncPendingRef.current = true;
+        useTrainingStore.setState({ runtimeSyncPending: true });
         return seq;
     }, []);
 
     const isCurrentConfigSync = useCallback((seq: number) => (
-        configSyncPendingRef.current && activeConfigSyncSeqRef.current === seq
+        useTrainingStore.getState().runtimeSyncPending && activeConfigSyncSeqRef.current === seq
     ), []);
 
     const finishConfigSyncIfCurrent = useCallback((seq: number) => {
         if (activeConfigSyncSeqRef.current === seq) {
-            configSyncPendingRef.current = false;
+            useTrainingStore.setState({ runtimeSyncPending: false });
         }
     }, []);
 
@@ -869,127 +908,134 @@ export function useTraining(): TrainingHook {
         return promise;
     }, []);
 
-    const applyFreshV2Run = useCallback((
-        result: InitializeExperimentResult,
-        owner: PreparedExperimentDocumentV2,
-    ) => {
-        // Preflight both strict boundaries before changing the active bridge
-        // generation or scientific store. A forged direct artifact must leave
-        // the entire previously accepted run observable and intact.
-        const evidence = parseWorkerEvidenceMessageV2(result.evidence);
-        const framePatch = buildStrictV2FramePatch(
-            result,
-            true,
-            owner,
-        );
-        const ts = useTrainingStore.getState();
-        const evidenceReplacement = ts.prepareEvidenceReplacement(evidence);
-        newRunTo(result.runId);
-        ts.commitEvidenceReplacement(evidenceReplacement);
-        updateFrameBuffer(framePatch, { requireArtifactProvenance: true });
-        const frameVersions = getFrameVersions();
-        applyFreshV2SnapshotToStore(ts, result, frameVersions);
-        activePreparedRef.current = owner;
-        ts.setCheckpointTimeline(parseCheckpointTimelineV2(result.checkpointTimeline));
-        ts.clearWorkerError();
-        ts.clearPauseReason();
-    }, []);
-
-    const publishCommittedV2Run = useCallback((
-        result: InitializeExperimentResult,
+    const trackWorkerRunCommit = useCallback((
+        resultPromise: Promise<InitializeExperimentResult>,
+        requestId: number,
+        lifecycleEpoch: number,
         owner: PreparedExperimentDocumentV2,
         source: TrainedRecipeSource,
-    ): boolean => {
+    ): Promise<AcknowledgedRun | null> => {
+        const committed = Promise.resolve(resultPromise).then((result) => {
+            if (!mountedRef.current || lifecycleEpochRef.current !== lifecycleEpoch
+                || rejectedPreparationRequestIdsRef.current.has(requestId)) return null;
+            const { evidenceGenerationId } = useTrainingStore.getState();
+            if (result.runId <= Math.max(acknowledgedRunRef.current?.runId ?? 0, evidenceGenerationId ?? 0)) {
+                return null;
+            }
+            // Even a superseded request may have committed on the worker.
+            // Validate it now and retain it as the fallback for a newer rejection.
+            const evidence = parseWorkerEvidenceMessageV2(result.evidence);
+            const dataset = evidence.latestEvaluation?.dataset;
+            if (!dataset) throw new Error('fresh V2 result requires dataset identity');
+            const run = {
+                runId: result.runId,
+                owner,
+                source,
+                dataset,
+                evidence,
+                framePatch: buildStrictV2FramePatch(result, true, owner),
+                timeline: parseCheckpointTimelineV2(result.checkpointTimeline),
+            };
+            acknowledgedRunRef.current = run;
+            usePlaygroundStore.getState().acknowledgeRuntimeDocument(owner);
+            return run;
+        });
+        const settled = committed.then(() => {}, () => {});
+        const inFlight = inFlightRunCommitsRef.current;
+        inFlight.set(requestId, settled);
+        void settled.then(() => inFlight.delete(requestId));
+        return committed;
+    }, []);
+
+    const publishCommittedV2Run = useCallback((run: AcknowledgedRun, publishAccess = true): void => {
         const ts = useTrainingStore.getState();
-        if (result.runId <= (ts.evidenceGenerationId ?? 0)) {
+        if (run.runId <= (ts.evidenceGenerationId ?? 0)) {
             throw new Error('fresh V2 result must advance the active generation monotonically');
         }
-        applyFreshV2Run(result, owner);
-        ts.setTrainPoints([]);
-        ts.setTestPoints([]);
+        const evidenceReplacement = ts.prepareEvidenceReplacement(run.evidence);
+        newRunTo(run.runId);
+        ts.commitEvidenceReplacement(evidenceReplacement);
+        updateFrameBuffer(run.framePatch, { requireArtifactProvenance: true });
+        ts.setFrameVersions(getFrameVersions());
+        activePreparedRef.current = run.owner;
+        ts.setCheckpointTimeline(run.timeline);
+        ts.clearWorkerError();
+        ts.clearPauseReason();
         ts.markTrainedRecipe(
-            owner.document.recipe,
-            source,
-            owner.identities.recipeFingerprint,
+            run.owner.document.recipe,
+            run.source,
+            run.owner.identities.recipeFingerprint,
         );
         ts.setStatus('idle');
         initializedRef.current = false;
-        return true;
-    }, [applyFreshV2Run]);
+        if (publishAccess) usePlaygroundStore.getState().acknowledgeRuntimeDocument(run.owner, true);
+    }, []);
 
-    const initializePrepared = useCallback(async (
-        requestedPrepared: PreparedExperimentDocumentV2 = requirePreparedExperiment(),
+    const hydrateCommittedV2Run = useCallback(async (
+        api: TrainingWorkerRemote,
+        runId: number,
+        dataset: DatasetRevision,
+        isCurrent: () => boolean,
     ): Promise<boolean> => {
-        const lifecycleEpoch = lifecycleEpochRef.current;
-        prevPreparedRef.current = requestedPrepared;
-        const request = nextRequest(requestedPrepared);
-        let api: TrainingWorkerRemote;
-        let result: InitializeExperimentResult;
-        try {
-            api = await getWorkerApi();
-            await ensureStreamChannel();
-            if (!mountedRef.current
-                || lifecycleEpochRef.current !== lifecycleEpoch
-                || activeRequestIdRef.current !== request.requestId) {
-                return false;
-            }
-            result = await api.initializeExperimentV2(request);
-        } catch (error) {
-            if (!mountedRef.current
-                || lifecycleEpochRef.current !== lifecycleEpoch
-                || activeRequestIdRef.current !== request.requestId) {
-                return false;
-            }
-            pendingPreparationRequestIdRef.current = null;
-            rejectedPreparationRequestIdsRef.current.delete(request.requestId);
-            throw error;
-        }
-        if (!mountedRef.current || lifecycleEpochRef.current !== lifecycleEpoch) return false;
-        if (rejectedPreparationRequestIdsRef.current.delete(request.requestId)) return false;
-        publishCommittedV2Run(result, requestedPrepared, 'initialize');
-        if (activeRequestIdRef.current !== request.requestId) return false;
-        pendingPreparationRequestIdRef.current = null;
-        if (currentPreparedExperiment() !== requestedPrepared) return false;
-        const ts = useTrainingStore.getState();
+        const points = await api.getDatasetPointsV2(runId, dataset.datasetKey);
+        if (!isCurrent()) return false;
+        validateDatasetPoints(points, runId, dataset);
 
-        // Hydration does not own generation identity. A failure below reports
-        // a runtime error, but never rolls the committed run back to stale UI.
-        const trainPts = await api.getTrainPointsV2();
-        if (!mountedRef.current || activeRequestIdRef.current !== request.requestId) return false;
-        const testPts = await api.getTestPointsV2();
-        if (!mountedRef.current || activeRequestIdRef.current !== request.requestId) return false;
-        const latestState = usePlaygroundStore.getState();
-        if (latestState.access.status !== 'ready'
-            || latestState.access.prepared !== requestedPrepared) return false;
-
-        // Send initial demand
-        await api.updateDemand(latestState.demand);
-        if (!mountedRef.current || activeRequestIdRef.current !== request.requestId) return false;
-
-        // AS-4: tell the worker whether the user has opted in to the
-        // WebGPU grid path. Capability detection still gates this; the
-        // worker silently falls back to CPU when the device isn't
-        // available or the network shape exceeds the shader caps.
+        await api.updateDemand(usePlaygroundStore.getState().demand);
+        if (!isCurrent()) return false;
         try {
             await api.setWebGpuEnabled(usePlaygroundStore.getState().featuresUI.webgpuGrid);
         } catch {
-            // Older worker bundles won't expose setWebGpuEnabled — ignore.
+            // The worker can fall back to CPU grids if WebGPU is unavailable.
         }
+        if (!isCurrent()) return false;
 
-        if (!mountedRef.current || activeRequestIdRef.current !== request.requestId) return false;
-        if (currentPreparedExperiment() !== requestedPrepared) return false;
-        ts.setTrainPoints(trainPts);
-        ts.setTestPoints(testPts);
-        initializedRef.current = true;
-        return true;
-    }, [ensureStreamChannel, nextRequest, publishCommittedV2Run]);
+        initializedRef.current = useTrainingStore.getState().hydrateDataset(
+            runId, points.trainPoints, points.testPoints,
+        );
+        return initializedRef.current;
+    }, []);
+
+    const initializePrepared = useCallback(async (
+        requestedPrepared: PreparedExperimentDocumentV2,
+        requestedRunRequestId: number,
+    ): Promise<boolean> => {
+        const lifecycleEpoch = lifecycleEpochRef.current;
+        prevRunRequestIdRef.current = requestedRunRequestId;
+        const request = nextRequest(requestedPrepared);
+        const isCurrent = () => mountedRef.current
+            && lifecycleEpochRef.current === lifecycleEpoch
+            && activeRequestIdRef.current === request.requestId
+            && isCurrentRunRequest(requestedRunRequestId, requestedPrepared);
+        const ts = useTrainingStore.getState();
+        if (ts.datasetStatus === 'error') ts.setDatasetLoading();
+        try {
+            const api = await getWorkerApi();
+            await ensureStreamChannel();
+            if (!isCurrent()) return false;
+            const run = await trackWorkerRunCommit(
+                api.initializeExperimentV2(request), request.requestId, lifecycleEpoch, requestedPrepared, 'initialize',
+            );
+            if (rejectedPreparationRequestIdsRef.current.delete(request.requestId) || !isCurrent()) return false;
+            pendingPreparationRequestIdRef.current = null;
+            if (!run) throw new Error('fresh V2 result must advance the active generation monotonically');
+            publishCommittedV2Run(run);
+            return await hydrateCommittedV2Run(api, run.runId, run.dataset, isCurrent);
+        } catch (error) {
+            rejectedPreparationRequestIdsRef.current.delete(request.requestId);
+            if (!isCurrent()) return false;
+            pendingPreparationRequestIdRef.current = null;
+            throw error;
+        }
+    }, [ensureStreamChannel, hydrateCommittedV2Run, nextRequest, publishCommittedV2Run, trackWorkerRunCommit]);
 
     const initializeWorker = useCallback((
-        requestedPrepared: PreparedExperimentDocumentV2 = requirePreparedExperiment(),
+        requestedPrepared: PreparedExperimentDocumentV2 = activePreparedRef.current ?? requirePreparedExperiment(),
     ): Promise<boolean> => {
+        const requestedRunRequestId = usePlaygroundStore.getState().runRequestId;
         const inFlight = initializationPromiseRef.current;
-        if (inFlight && prevPreparedRef.current === requestedPrepared) return inFlight;
-        const promise = initializePrepared(requestedPrepared);
+        if (inFlight && prevRunRequestIdRef.current === requestedRunRequestId) return inFlight;
+        const promise = initializePrepared(requestedPrepared, requestedRunRequestId);
         initializationPromiseRef.current = promise;
         const clear = () => {
             if (initializationPromiseRef.current === promise) {
@@ -1032,12 +1078,12 @@ export function useTraining(): TrainingHook {
                         || error.requestId !== pendingPreparationRequestIdRef.current) return;
                     pendingPreparationRequestIdRef.current = null;
                     rejectedPreparationRequestIdsRef.current.add(error.requestId);
-                    activeRequestIdRef.current = null;
-                    if (configSyncPendingRef.current) {
-                        configSyncPendingRef.current = false;
-                        ts.failConfigChange(error.message);
+                    const configSyncRejection = configSyncRejectionRef.current;
+                    if (configSyncRejection?.requestId === error.requestId) {
+                        configSyncRejection.reject(error.message);
                         return;
                     }
+                    activeRequestIdRef.current = null;
                     reportWorkerError(error.message, 'Failed to prepare the experiment.');
                     return;
                 }
@@ -1105,6 +1151,7 @@ export function useTraining(): TrainingHook {
         lifecycleEpochRef.current++;
         mountedRef.current = true;
         if (e2eStartupFaultActiveRef.current) return;
+        const prepared = currentPreparedExperiment();
         if (!prepared) {
             reportWorkerError(
                 new Error('Training is unavailable because the shared experiment URL is incompatible with version 2.'),
@@ -1133,24 +1180,83 @@ export function useTraining(): TrainingHook {
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
-    // Every accepted prepared-document replacement starts a fresh generation.
+    // An explicit run request starts a fresh generation even for an identical recipe.
     useEffect(() => {
         if (e2eStartupFaultActiveRef.current) return;
-        const isRetry = configSyncNonce !== prevConfigSyncNonceRef.current;
-        if (!prepared) return;
-        if (!isRetry && prevPreparedRef.current === prepared) return;
-        const previousPrepared = prevPreparedRef.current;
-        prevPreparedRef.current = prepared;
+        const retryRequested = configSyncNonce !== prevConfigSyncNonceRef.current;
+        const visiblePrepared = currentPreparedExperiment();
+        if (!visiblePrepared) return;
+        if (!retryRequested && prevRunRequestIdRef.current === runRequestId) return;
+        prevRunRequestIdRef.current = runRequestId;
         prevConfigSyncNonceRef.current = configSyncNonce;
+        const ts = useTrainingStore.getState();
+        const rejected = ts.rejectedConfigRequest;
+        const retry = retryRequested && rejected?.runRequestId === runRequestId ? rejected : null;
+        const prepared = retry ? {
+            ...retry.prepared,
+            document: { ...retry.prepared.document, view: visiblePrepared.document.view },
+        } : visiblePrepared;
+        const requestSource = retry?.runRequestSource ?? usePlaygroundStore.getState().runRequestSource;
+        const candidate: RejectedConfigRequest = { runRequestId, runRequestSource: requestSource, prepared };
+        const source = requestSource === 'document' ? ts.pendingConfigSource ?? 'setup' : requestSource;
+        if (ts.pendingConfigSource !== source) ts.beginConfigChange(source);
         const seq = beginConfigSync();
         const request = nextRequest(prepared);
         const lifecycleEpoch = lifecycleEpochRef.current;
+        const isCurrent = () => mountedRef.current
+            && lifecycleEpochRef.current === lifecycleEpoch
+            && isCurrentConfigSync(seq)
+            && activeRequestIdRef.current === request.requestId
+            && isCurrentRunRequest(runRequestId, visiblePrepared);
+
+        let rejecting = false;
+        const reject = (message: string) => {
+            if (rejecting || !isCurrent()) return;
+            rejecting = true;
+            const recover = () => {
+                if (!isCurrent()) return;
+                const acknowledged = acknowledgedRunRef.current;
+                if (acknowledged && acknowledged.runId > (useTrainingStore.getState().evidenceGenerationId ?? 0)) {
+                    publishCommittedV2Run(acknowledged, false);
+                }
+                ts.failConfigChange(message, candidate);
+                if (acknowledged) {
+                    const playground = usePlaygroundStore.getState();
+                    playground.restoreAcknowledgedDocument(acknowledged.owner);
+                    playground.syncToUrl();
+                }
+                if (!acknowledged || initializedRef.current) {
+                    finishConfigSyncIfCurrent(seq);
+                    return;
+                }
+                const recoveryIsCurrent = () => mountedRef.current
+                    && lifecycleEpochRef.current === lifecycleEpoch
+                    && isCurrentConfigSync(seq)
+                    && activeRequestIdRef.current === request.requestId
+                    && usePlaygroundStore.getState().runRequestId === runRequestId;
+                void getWorkerApi().then((api) => hydrateCommittedV2Run(
+                    api, acknowledged.runId, acknowledged.dataset, recoveryIsCurrent,
+                )).catch((error) => {
+                    if (recoveryIsCurrent()) reportWorkerError(error, 'Failed to hydrate the previous experiment runtime.');
+                }).finally(() => finishConfigSyncIfCurrent(seq));
+            };
+            // RPC responses for earlier worker commits and the current stream
+            // error arrive on separate channels. Reconcile with the newest
+            // validated commit before handing control back to the user.
+            const earlier = [...inFlightRunCommitsRef.current]
+                .filter(([requestId]) => requestId < request.requestId
+                    && !rejectedPreparationRequestIdsRef.current.has(requestId))
+                .map(([, settled]) => settled);
+            if (earlier.length > 0) void Promise.all(earlier).then(recover);
+            else recover();
+        };
+        configSyncRejectionRef.current = { requestId: request.requestId, reject };
 
         const sync = async () => {
             const restoreBarrier = restoreBarrierRef.current;
             if (restoreBarrier) {
                 await restoreBarrier;
-                if (!isCurrentConfigSync(seq)) return;
+                if (!isCurrent()) return;
             }
             // Serialize MessagePort pause with the Comlink mutation. The
             // paused status is the acknowledgement that the old loop and its
@@ -1158,109 +1264,65 @@ export function useTraining(): TrainingHook {
             try {
                 await pauseForMutation();
             } catch (error) {
-                if (mountedRef.current && isCurrentConfigSync(seq)) {
-                    useTrainingStore.getState().failConfigChange(
-                        getErrorMessage(error, 'Failed to pause the current experiment.'),
-                    );
-                    finishConfigSyncIfCurrent(seq);
-                }
+                if (isCurrent()) pendingPreparationRequestIdRef.current = null;
+                reject(getErrorMessage(error, 'Failed to pause the current experiment.'));
                 return;
             }
-            if (!mountedRef.current
-                || lifecycleEpochRef.current !== lifecycleEpoch
-                || !isCurrentConfigSync(seq)) return;
+            if (!isCurrent()) return;
 
-            const ts = useTrainingStore.getState();
             let api: TrainingWorkerRemote;
-            let result: InitializeExperimentResult;
+            let run: AcknowledgedRun;
             try {
                 api = await getWorkerApi();
                 await ensureStreamChannel();
-                if (!mountedRef.current
-                    || lifecycleEpochRef.current !== lifecycleEpoch
-                    || !isCurrentConfigSync(seq)
-                    || activeRequestIdRef.current !== request.requestId) return;
-                result = await api.initializeExperimentV2(request);
-                if (!mountedRef.current || lifecycleEpochRef.current !== lifecycleEpoch) return;
-                if (rejectedPreparationRequestIdsRef.current.delete(request.requestId)) return;
-                publishCommittedV2Run(result, prepared, 'config-sync');
-                if (!isCurrentConfigSync(seq)
-                    || activeRequestIdRef.current !== request.requestId) return;
+                if (!isCurrent()) return;
+                const committed = await trackWorkerRunCommit(
+                    api.initializeExperimentV2(request), request.requestId, lifecycleEpoch, prepared, 'config-sync',
+                );
+                if (rejectedPreparationRequestIdsRef.current.delete(request.requestId) || !isCurrent()) return;
                 pendingPreparationRequestIdRef.current = null;
-                const committed = usePlaygroundStore.getState();
-                if (committed.access.status !== 'ready'
-                    || committed.access.prepared !== prepared) return;
+                if (!committed) throw new Error('fresh V2 result must advance the active generation monotonically');
+                run = committed;
+                publishCommittedV2Run(run);
             } catch (error) {
-                if (!mountedRef.current || !isCurrentConfigSync(seq)) return;
-                if (pendingPreparationRequestIdRef.current === request.requestId) {
-                    pendingPreparationRequestIdRef.current = null;
-                }
                 rejectedPreparationRequestIdsRef.current.delete(request.requestId);
-                prevPreparedRef.current = previousPrepared;
-                ts.failConfigChange(error instanceof Error ? error.message : 'Failed to update configuration');
-                finishConfigSyncIfCurrent(seq);
+                if (!isCurrent()) return;
+                pendingPreparationRequestIdRef.current = null;
+                reject(getErrorMessage(error, 'Failed to update configuration.'));
                 return;
             }
 
-            // The worker/app identity commit above cannot be rolled back.
-            // Auxiliary failures become runtime errors, never config rollback.
-            let auxiliaryError: unknown = null;
-            let trainPts: DataPoint[] = [];
-            let testPts: DataPoint[] = [];
+            usePlaygroundStore.getState().syncToUrl();
+            const publicationIsCurrent = () => mountedRef.current
+                && lifecycleEpochRef.current === lifecycleEpoch
+                && isCurrentConfigSync(seq)
+                && activeRequestIdRef.current === request.requestId
+                && isCurrentRunRequest(runRequestId, prepared);
             try {
-                usePlaygroundStore.getState().syncToUrl();
+                await hydrateCommittedV2Run(api, run.runId, run.dataset, publicationIsCurrent);
             } catch (error) {
-                auxiliaryError = error;
+                if (publicationIsCurrent()) {
+                    reportWorkerError(error, 'Failed to hydrate the new experiment runtime.');
+                }
             }
-            try {
-                trainPts = await api.getTrainPointsV2();
-            } catch (error) {
-                auxiliaryError = error;
-            }
-            if (!mountedRef.current || !isCurrentConfigSync(seq)) return;
-            try {
-                testPts = await api.getTestPointsV2();
-            } catch (error) {
-                auxiliaryError ??= error;
-            }
-            if (!mountedRef.current || !isCurrentConfigSync(seq)) return;
-            const latest = usePlaygroundStore.getState();
-            if (latest.access.status !== 'ready'
-                || latest.access.prepared !== prepared) return;
-            try {
-                await api.updateDemand(latest.demand);
-            } catch (error) {
-                auxiliaryError ??= error;
-            }
-            if (!mountedRef.current || !isCurrentConfigSync(seq)) return;
-            try {
-                await api.setWebGpuEnabled(latest.featuresUI.webgpuGrid);
-            } catch {
-                // Capability and older-bundle fallbacks remain non-fatal.
-            }
-            if (!mountedRef.current || !isCurrentConfigSync(seq)) return;
-
-            ts.setTrainPoints(trainPts);
-            ts.setTestPoints(testPts);
-            initializedRef.current = true;
+            if (!publicationIsCurrent()) return;
             ts.finishConfigChange();
             finishConfigSyncIfCurrent(seq);
-            if (auxiliaryError !== null) {
-                reportWorkerError(auxiliaryError, 'Failed to hydrate the new experiment runtime.');
-            }
         };
         void sync();
     }, [
-        prepared,
+        runRequestId,
         configSyncNonce,
         beginConfigSync,
         finishConfigSyncIfCurrent,
         ensureStreamChannel,
+        hydrateCommittedV2Run,
         isCurrentConfigSync,
         nextRequest,
         pauseForMutation,
         publishCommittedV2Run,
         reportWorkerError,
+        trackWorkerRunCommit,
     ]);
 
     // Sync demand changes to worker
@@ -1294,10 +1356,12 @@ export function useTraining(): TrainingHook {
     }, [webgpuGrid]);
 
     const play = useCallback(() => {
-        if (configSyncPendingRef.current
+        const training = useTrainingStore.getState();
+        if (useTrainingStore.getState().runtimeSyncPending
             || mutationPausePromiseRef.current !== null
             || manualActionPendingRef.current
-            || useTrainingStore.getState().pendingConfigSource !== null) {
+            || training.pendingConfigSource !== null
+            || selectCheckpointBranchComplete(training)) {
             return;
         }
 
@@ -1315,12 +1379,13 @@ export function useTraining(): TrainingHook {
         };
 
         if (!initializedRef.current) {
-            initializeWorker().catch((error) => {
-                reportWorkerError(error, 'Failed to initialize training worker.');
-            }).then(() => {
-                if (initializedRef.current) {
+            void initializeWorker().then((ready) => {
+                if (ready && mountedRef.current && !useTrainingStore.getState().runtimeSyncPending
+                    && useTrainingStore.getState().pendingConfigSource === null) {
                     startTraining();
                 }
+            }).catch((error) => {
+                reportWorkerError(error, 'Failed to initialize training worker.');
             });
             return;
         }
@@ -1340,7 +1405,9 @@ export function useTraining(): TrainingHook {
     }, [pauseForMutation, reportWorkerError]);
 
     const step = useCallback(async () => {
-        if (configSyncPendingRef.current || useTrainingStore.getState().pendingConfigSource !== null) {
+        const training = useTrainingStore.getState();
+        if (training.runtimeSyncPending || training.pendingConfigSource !== null
+            || selectCheckpointBranchComplete(training)) {
             return;
         }
         if (manualActionPendingRef.current) return;
@@ -1348,21 +1415,21 @@ export function useTraining(): TrainingHook {
         const wasPlaying = isPlayingRef.current;
         try {
             await pauseForMutation();
-            if (configSyncPendingRef.current
+            if (useTrainingStore.getState().runtimeSyncPending
                 || useTrainingStore.getState().pendingConfigSource !== null) return;
             if (wasPlaying) {
                 useTrainingStore.getState().setPauseReason('manual');
                 useTrainingStore.getState().setStatus('paused');
             }
             if (!initializedRef.current) {
-                await initializeWorker();
-                if (!initializedRef.current) return;
+                const ready = await initializeWorker();
+                if (!ready) return;
             }
             const api = await getWorkerApi();
-            const result = await api.stepExperimentV2(1);
+            const result = await api.stepExperimentV2(1, 'current');
             if (!mountedRef.current) return;
             const ts = useTrainingStore.getState();
-            if (configSyncPendingRef.current
+            if (ts.runtimeSyncPending
                 || ts.pendingConfigSource !== null
                 || result.runId !== ts.evidenceGenerationId) return;
             const resultRevision = selectScientificEvidence({
@@ -1407,52 +1474,54 @@ export function useTraining(): TrainingHook {
     }, [initializeWorker, pauseForMutation, reportWorkerError]);
 
     const reset = useCallback(async () => {
-        if (configSyncPendingRef.current
+        if (useTrainingStore.getState().runtimeSyncPending
             || manualActionPendingRef.current
             || useTrainingStore.getState().pendingConfigSource !== null) {
             return;
         }
         const seq = beginConfigSync();
+        const resetRunRequestId = usePlaygroundStore.getState().runRequestId;
+        const lifecycleEpoch = lifecycleEpochRef.current;
+        const resetPrepared = activePreparedRef.current ?? currentPreparedExperiment();
+        const isCurrent = () => mountedRef.current && isCurrentConfigSync(seq)
+            && lifecycleEpochRef.current === lifecycleEpoch
+            && (resetPrepared === null || isCurrentRunRequest(resetRunRequestId, resetPrepared));
         useTrainingStore.getState().clearPauseReason();
         try {
             await pauseForMutation();
-            if (!mountedRef.current || !isCurrentConfigSync(seq)) return;
+            if (!isCurrent()) return;
             if (!initializedRef.current) {
-                await initializeWorker();
-                if (!isCurrentConfigSync(seq)) return;
-                useTrainingStore.getState().setStatus('idle');
-                finishConfigSyncIfCurrent(seq);
+                const ready = await initializeWorker();
+                if (ready && isCurrent()) useTrainingStore.getState().setStatus('idle');
                 return;
             }
             const api = await getWorkerApi();
-            const resetPrepared = requirePreparedExperiment();
-            const result = await api.resetExperimentV2();
-            if (!mountedRef.current) return;
-            publishCommittedV2Run(result, resetPrepared, 'reset');
-            if (!isCurrentConfigSync(seq)) return;
-            if (currentPreparedExperiment() !== resetPrepared) return;
-            const ts = useTrainingStore.getState();
-
-            // Auxiliary reset hydration cannot roll generation identity back.
-            const trainPts = await api.getTrainPointsV2();
-            if (!mountedRef.current || !isCurrentConfigSync(seq)) return;
-            const testPts = await api.getTestPointsV2();
-            if (!mountedRef.current || !isCurrentConfigSync(seq)) return;
-            if (currentPreparedExperiment() !== resetPrepared) return;
-            ts.setTrainPoints(trainPts);
-            ts.setTestPoints(testPts);
-            initializedRef.current = true;
-            finishConfigSyncIfCurrent(seq);
+            if (!isCurrent() || !resetPrepared) return;
+            const requestId = ++requestIdRef.current;
+            const run = await trackWorkerRunCommit(
+                api.resetExperimentV2(), requestId, lifecycleEpoch, resetPrepared, 'reset',
+            );
+            if (!isCurrent()) return;
+            if (!run) throw new Error('fresh V2 result must advance the active generation monotonically');
+            publishCommittedV2Run(run);
+            await hydrateCommittedV2Run(api, run.runId, run.dataset, isCurrent);
         } catch (error) {
-            if (!isCurrentConfigSync(seq)) return;
-            reportWorkerError(error, 'Failed to reset training.');
+            if (isCurrent()) reportWorkerError(error, 'Failed to reset training.');
+        } finally {
             finishConfigSyncIfCurrent(seq);
         }
-    }, [beginConfigSync, finishConfigSyncIfCurrent, initializeWorker, isCurrentConfigSync, pauseForMutation, publishCommittedV2Run, reportWorkerError]);
+    }, [beginConfigSync, finishConfigSyncIfCurrent, hydrateCommittedV2Run, initializeWorker, isCurrentConfigSync, pauseForMutation, publishCommittedV2Run, reportWorkerError, trackWorkerRunCommit]);
 
-    const restoreCheckpoint = useCallback(async (id: number) => {
+    const applyCheckpoint = useCallback(async (
+        id: number,
+        action: 'restore' | 'branch',
+        trainingSteps?: number,
+    ) => {
         if (!Number.isSafeInteger(id) || id < 1) return;
-        if (configSyncPendingRef.current
+        if (trainingSteps !== undefined && !isCheckpointBranchStepCount(trainingSteps)) {
+            throw new RangeError('Choose a whole number of training steps within the branch limit.');
+        }
+        if (useTrainingStore.getState().runtimeSyncPending
             || manualActionPendingRef.current
             || restoreBarrierRef.current !== null
             || useTrainingStore.getState().pendingConfigSource !== null) {
@@ -1467,50 +1536,66 @@ export function useTraining(): TrainingHook {
             releaseRestore = resolve;
         });
         restoreBarrierRef.current = restoreBarrier;
+        const lifecycleEpoch = lifecycleEpochRef.current;
         try {
             await pauseForMutation();
-            if (!mountedRef.current || configSyncPendingRef.current) return;
+            if (!mountedRef.current || useTrainingStore.getState().runtimeSyncPending) return;
             if (!initializedRef.current) {
                 await initializeWorker();
                 if (!initializedRef.current) return;
             }
-            const restoredPrepared = requirePreparedExperiment();
+            const restoredPrepared = activePreparedRef.current;
             const before = useTrainingStore.getState();
             const currentGeneration = before.evidenceGenerationId;
-            const currentRevision = selectScientificEvidence({
+            const currentModel = selectScientificEvidence({
                 latestLiveSignal: before.latestLiveSignal,
                 latestEvaluation: before.latestEvaluation,
-            }).currentModel?.revision;
-            if (currentGeneration === null || currentRevision === undefined) {
-                throw new Error('checkpoint restore requires current scientific evidence');
+            }).currentModel;
+            if (currentGeneration === null || !currentModel || !restoredPrepared) {
+                throw new Error('applying a checkpoint requires current scientific evidence');
             }
             const requestId = requestIdRef.current + 1;
             requestIdRef.current = requestId;
             const api = await getWorkerApi();
-            const result = await api.restoreCheckpointV2({
-                type: 'restore-checkpoint',
+            const request = {
                 protocolVersion: WORKER_PROTOCOL_VERSION,
                 requestId,
                 checkpointId: id,
-            });
-            const currentPrepared = currentPreparedExperiment();
+            };
+            const result = action === 'branch'
+                ? await api.branchCheckpointV2({
+                    ...request, type: 'branch-checkpoint',
+                    ...(trainingSteps === undefined ? {} : { trainingSteps }),
+                })
+                : await api.restoreCheckpointV2({ ...request, type: 'restore-checkpoint' });
             if (!mountedRef.current
-                || configSyncPendingRef.current
-                || currentPrepared?.identities.recipeFingerprint
-                    !== restoredPrepared.identities.recipeFingerprint) {
+                || lifecycleEpochRef.current !== lifecycleEpoch
+                || activePreparedRef.current !== restoredPrepared) {
                 return;
             }
             const ts = useTrainingStore.getState();
             const evaluation = result.evidence.latestEvaluation;
             if (result.runId !== currentGeneration
                 || evaluation?.model.generationId !== currentGeneration
-                || evaluation.model.revision !== currentRevision + 1) {
-                throw new Error('checkpoint restore must advance the current revision exactly once');
+                || evaluation.model.revision !== currentModel.revision + 1) {
+                throw new Error('applying a checkpoint must advance the current revision exactly once');
             }
             const timeline = parseCheckpointTimelineV2(result.checkpointTimeline);
-            if (timeline.restoredCheckpointId !== id
-                || !timeline.checkpoints.some((checkpoint) => checkpoint.id === id)) {
-                throw new Error('checkpoint restore timeline does not identify the restored checkpoint');
+            const appliedCheckpointId = action === 'branch'
+                ? timeline.branch?.sourceCheckpointId
+                : timeline.restoredCheckpointId;
+            if (appliedCheckpointId !== id) {
+                throw new Error(`checkpoint timeline does not identify the ${action} source`);
+            }
+            if (action === 'branch') {
+                const source = timeline.checkpoints.find((point) => point.id === id);
+                const previous = timeline.checkpoints.find((point) => point.id === timeline.branch?.previousCheckpointId);
+                const expectedTarget = trainingSteps === undefined ? undefined : evaluation.model.step + trainingSteps;
+                if (source?.step !== evaluation.model.step || source.epoch !== evaluation.model.epoch
+                    || previous?.step !== currentModel.step || previous.epoch !== currentModel.epoch
+                    || timeline.branch?.targetStep !== expectedTarget) {
+                    throw new Error('checkpoint branch timeline does not match the source and previous models');
+                }
             }
             const evidence = validateEvidenceAgainstPrepared(result.evidence, restoredPrepared);
             const evidenceReplacement = ts.prepareEvidenceReplacement(evidence);
@@ -1536,7 +1621,10 @@ export function useTraining(): TrainingHook {
             ts.setStatus('paused');
             ts.clearWorkerError();
         } catch (error) {
-            reportWorkerError(error, 'Failed to restore checkpoint.');
+            reportWorkerError(error, action === 'branch'
+                ? 'Failed to branch from checkpoint.'
+                : 'Failed to restore checkpoint.');
+            if (action === 'branch') throw error;
         } finally {
             if (restoreBarrierRef.current === restoreBarrier) {
                 restoreBarrierRef.current = null;
@@ -1546,16 +1634,26 @@ export function useTraining(): TrainingHook {
         }
     }, [initializeWorker, pauseForMutation, reportWorkerError]);
 
+    const restoreCheckpoint = useCallback((id: number) => applyCheckpoint(id, 'restore'), [applyCheckpoint]);
+    const branchCheckpoint = useCallback((id: number, trainingSteps?: number) => (
+        applyCheckpoint(id, 'branch', trainingSteps)
+    ), [applyCheckpoint]);
+
     // Cleanup on unmount
     useEffect(() => {
         const lifecycleEpoch = lifecycleEpochRef;
         const rejectedPreparationRequestIds = rejectedPreparationRequestIdsRef;
+        const inFlightRunCommits = inFlightRunCommitsRef;
         return () => {
             mountedRef.current = false;
             lifecycleEpoch.current++;
+            activePreparedRef.current = null;
+            acknowledgedRunRef.current = null;
+            inFlightRunCommits.current.clear();
             activeRequestIdRef.current = null;
             pendingPreparationRequestIdRef.current = null;
             rejectedPreparationRequestIds.current.clear();
+            configSyncRejectionRef.current = null;
             streamSetupPromiseRef.current = null;
             initializationPromiseRef.current = null;
             mutationPauseRejectRef.current?.(new Error('Training hook unmounted'));
@@ -1564,9 +1662,9 @@ export function useTraining(): TrainingHook {
             mutationPauseRejectRef.current = null;
             activeConfigSyncSeqRef.current = configSyncSeqRef.current + 1;
             configSyncSeqRef.current = activeConfigSyncSeqRef.current;
-            configSyncPendingRef.current = false;
             manualActionPendingRef.current = false;
             isPlayingRef.current = false;
+            initializedRef.current = false;
             terminateWorker();
             const ts = useTrainingStore.getState();
             ts.resetEvidence();
@@ -1581,16 +1679,16 @@ export function useTraining(): TrainingHook {
                 confusionMatrixVersion: frameVersions.confusionMatrixVersion,
                 activationHistogramsVersion: frameVersions.activationHistogramsVersion,
                 multiclassBoundaryVersion: frameVersions.multiclassBoundaryVersion,
-                trainPoints: [],
-                testPoints: [],
                 dataConfigLoading: false,
                 networkConfigLoading: false,
                 featuresConfigLoading: false,
                 trainingConfigLoading: false,
                 presetConfigLoading: false,
                 pendingConfigSource: null,
+                runtimeSyncPending: false,
                 configError: null,
                 configErrorSource: null,
+                rejectedConfigRequest: null,
                 workerError: null,
                 pauseReason: null,
                 checkpointTimeline: EMPTY_CHECKPOINT_TIMELINE,
@@ -1602,5 +1700,5 @@ export function useTraining(): TrainingHook {
         };
     }, []);
 
-    return { play, pause, step, reset, restoreCheckpoint };
+    return { play, pause, step, reset, restoreCheckpoint, branchCheckpoint };
 }

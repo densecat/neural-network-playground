@@ -300,6 +300,7 @@ export class EvaluationRuntime {
      */
     prepareRestoreEvaluation(
         options: RestoreEvaluationPreparationOptions,
+        afterCheckpoint?: PreparedCheckpointEvaluation,
     ): PreparedRestoreEvaluation {
         const model = this.validateAndFreezeModel(options.model);
         if (model.revision <= this.currentModel.revision) {
@@ -307,7 +308,17 @@ export class EvaluationRuntime {
         }
         const expectedEvaluationId = this.nextEvaluationId;
         const expectedCurrentModel = this.currentModel;
-        const evaluation = this.evaluateCandidate('restore', model, options);
+        if (afterCheckpoint !== undefined && (
+            afterCheckpoint.evaluation.evaluationId !== expectedEvaluationId
+            || !sameModel(afterCheckpoint.evaluation.model, expectedCurrentModel)
+        )) {
+            throw new Error('prepared checkpoint evaluation cannot precede this restore');
+        }
+        const restoreEvaluationId = expectedEvaluationId + (afterCheckpoint === undefined ? 0 : 1);
+        if (!Number.isSafeInteger(restoreEvaluationId)) {
+            throw new RangeError('restore evaluation ID exhausted its safe integer range');
+        }
+        const evaluation = this.evaluateCandidate('restore', model, options, restoreEvaluationId);
         let committed = false;
         return Object.freeze({
             evaluation,
@@ -317,6 +328,7 @@ export class EvaluationRuntime {
                     || !sameModel(this.currentModel, expectedCurrentModel)) {
                     throw new Error('prepared restore evaluation is stale');
                 }
+                afterCheckpoint?.commit();
                 this.commitEvaluation(evaluation);
                 this._latestLiveSignal = undefined;
                 committed = true;
