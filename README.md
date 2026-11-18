@@ -76,8 +76,8 @@ local layout preferences migrate without deleting the old key or saved records.
 
 ### Prerequisites
 
-- [Node.js](https://nodejs.org/) v20+
-- [pnpm](https://pnpm.io/) v9+
+- [Node.js](https://nodejs.org/) 20.19+, 22.13+, or 24+ (see the supported ranges in `package.json`)
+- [pnpm](https://pnpm.io/) 9.15.9 (pinned in `package.json`)
 
 ### Development
 
