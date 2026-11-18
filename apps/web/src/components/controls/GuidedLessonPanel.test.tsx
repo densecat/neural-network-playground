@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
@@ -496,7 +496,6 @@ describe('GuidedLessonPanel', () => {
     });
 
     it('ends at the exact lesson destination for all 70 catalog-source transitions', async () => {
-        const user = userEvent.setup();
         const viewResult = await usePlaygroundStore.getState().editView(() => ({
             showTestData: true,
             discretizeOutput: true,
@@ -523,11 +522,12 @@ describe('GuidedLessonPanel', () => {
                         onHighlightChange={onHighlightChange}
                     />,
                 );
-                await user.selectOptions(
-                    screen.getByRole('combobox', { name: 'Guided lesson' }),
-                    lesson.id,
-                );
-                await user.click(screen.getByRole('button', { name: 'Start lesson and reset' }));
+                fireEvent.change(screen.getByRole('combobox', { name: 'Guided lesson' }), {
+                    target: { value: lesson.id },
+                });
+                await act(async () => {
+                    fireEvent.click(screen.getByRole('button', { name: 'Start lesson and reset' }));
+                });
 
                 await waitFor(() => {
                     expect(

@@ -1,4 +1,5 @@
 import {
+    normalizeUint32Seed,
     validateNetworkSessionStateV2,
     type NetworkSessionStateV2,
     type OptimizerSpecV2,
@@ -31,6 +32,16 @@ export interface SessionCheckpointV2 {
     };
     readonly trajectoryGuarantee: 'parameters-and-optimizer-only';
 }
+
+export interface SessionCheckpointV3 extends Omit<
+    SessionCheckpointV2, 'schemaVersion' | 'cursor' | 'trajectoryGuarantee'
+> {
+    readonly schemaVersion: 3;
+    readonly cursor: SessionCheckpointV2['cursor'] & { readonly shufflePrngState: number };
+    readonly trajectoryGuarantee: 'same-recipe-training-trajectory';
+}
+
+export type SessionCheckpoint = SessionCheckpointV2 | SessionCheckpointV3;
 
 export interface SessionCheckpointValidationContext {
     readonly recipeFingerprint: string;
@@ -466,11 +477,14 @@ function parseCursor(
     model: ModelRevision,
     trainCount: number,
     budget: TypedArrayBudget,
-): SessionCheckpointV2['cursor'] {
+    schemaVersion: 2 | 3,
+): SessionCheckpoint['cursor'] {
     const cursor = exactRecord(
         value,
         'checkpoint.cursor',
-        ['epoch', 'batchStart', 'shuffledIndices'],
+        schemaVersion === 3
+            ? ['epoch', 'batchStart', 'shuffledIndices', 'shufflePrngState']
+            : ['epoch', 'batchStart', 'shuffledIndices'],
     );
     const epoch = safeInteger(cursor['epoch'], 'checkpoint.cursor.epoch', 0);
     const batchStart = safeInteger(cursor['batchStart'], 'checkpoint.cursor.batchStart', 0);
@@ -498,18 +512,28 @@ function parseCursor(
         }
         seen[sampleIndex] = 1;
     }
-    return {
+    const base = {
         epoch,
         batchStart,
         shuffledIndices: cloneView(indices.view, Uint32Array, indices.length),
     };
+    if (schemaVersion === 2) return base;
+    const shufflePrngState = safeInteger(
+        cursor['shufflePrngState'], 'checkpoint.cursor.shufflePrngState', 0,
+    );
+    try {
+        normalizeUint32Seed(shufflePrngState);
+    } catch {
+        fail('checkpoint.cursor.shufflePrngState', 'must be an unsigned 32-bit integer');
+    }
+    return { ...base, shufflePrngState };
 }
 
-/** Validate a complete V2 checkpoint and return a fully detached clone. */
-export function validateSessionCheckpointV2(
+function validateCheckpointVersion(
     value: unknown,
     context: SessionCheckpointValidationContext,
-): SessionCheckpointV2 {
+    expectedVersion?: 2 | 3,
+): SessionCheckpoint {
     const checkpoint = exactRecord(value, 'checkpoint', [
         'kind',
         'schemaVersion',
@@ -526,7 +550,13 @@ export function validateSessionCheckpointV2(
     if (checkpoint['kind'] !== 'nn-playground-session-checkpoint') {
         fail('checkpoint.kind', 'must be nn-playground-session-checkpoint');
     }
-    if (checkpoint['schemaVersion'] !== 2) fail('checkpoint.schemaVersion', 'must equal 2');
+    const schemaVersion = checkpoint['schemaVersion'];
+    if (expectedVersion !== undefined && schemaVersion !== expectedVersion) {
+        fail('checkpoint.schemaVersion', `must equal ${expectedVersion}`);
+    }
+    if (schemaVersion !== 2 && schemaVersion !== 3) {
+        fail('checkpoint.schemaVersion', 'must equal 2 or 3');
+    }
     const recipeFingerprint = boundedIdentity(
         checkpoint['recipeFingerprint'],
         'checkpoint.recipeFingerprint',
@@ -542,11 +572,11 @@ export function validateSessionCheckpointV2(
     if (datasetKey !== context.dataset.datasetKey) {
         fail('checkpoint.datasetKey', 'does not match the active dataset');
     }
-    if (checkpoint['trajectoryGuarantee'] !== 'parameters-and-optimizer-only') {
-        fail(
-            'checkpoint.trajectoryGuarantee',
-            'must be parameters-and-optimizer-only',
-        );
+    const trajectoryGuarantee = schemaVersion === 3
+        ? 'same-recipe-training-trajectory'
+        : 'parameters-and-optimizer-only';
+    if (checkpoint['trajectoryGuarantee'] !== trajectoryGuarantee) {
+        fail('checkpoint.trajectoryGuarantee', `must be ${trajectoryGuarantee}`);
     }
 
     const model = parseModel(checkpoint['model'], 'checkpoint.model');
@@ -589,14 +619,14 @@ export function validateSessionCheckpointV2(
         model,
         context.dataset.trainCount,
         budget,
+        schemaVersion,
     );
     if (isInitialSeed && cursor.batchStart !== 0) {
         fail('checkpoint.cursor.batchStart', 'initial checkpoint cursor must begin at zero');
     }
 
-    return {
-        kind: 'nn-playground-session-checkpoint',
-        schemaVersion: 2,
+    const base = {
+        kind: 'nn-playground-session-checkpoint' as const,
         recipeFingerprint,
         objectiveKey,
         datasetKey,
@@ -604,7 +634,35 @@ export function validateSessionCheckpointV2(
         evaluation,
         network: session.network,
         optimizer: session.optimizer,
+    };
+    if (schemaVersion === 3 && 'shufflePrngState' in cursor) {
+        return {
+            ...base,
+            schemaVersion,
+            cursor,
+            trajectoryGuarantee: 'same-recipe-training-trajectory',
+        };
+    }
+    return {
+        ...base,
+        schemaVersion: 2,
         cursor,
         trajectoryGuarantee: 'parameters-and-optimizer-only',
     };
+}
+
+/** Validate a complete V2 checkpoint and return a fully detached clone. */
+export function validateSessionCheckpointV2(
+    value: unknown,
+    context: SessionCheckpointValidationContext,
+): SessionCheckpointV2 {
+    return validateCheckpointVersion(value, context, 2) as SessionCheckpointV2;
+}
+
+/** Validate a supported checkpoint without upgrading its trajectory guarantee. */
+export function validateSessionCheckpoint(
+    value: unknown,
+    context: SessionCheckpointValidationContext,
+): SessionCheckpoint {
+    return validateCheckpointVersion(value, context);
 }

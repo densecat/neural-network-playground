@@ -1,4 +1,5 @@
 import type {
+    CheckpointTimeline,
     EvaluationTrigger,
     LiveTrainingSignal,
     ModelRevision,
@@ -47,6 +48,14 @@ function newestModel(
     return evaluation.model.revision > live.model.revision
         ? evaluation.model
         : live.model;
+}
+
+export function selectCheckpointBranchComplete(
+    state: ScientificEvidenceInput & { readonly checkpointTimeline: CheckpointTimeline },
+): boolean {
+    const target = state.checkpointTimeline.branch?.targetStep;
+    const model = newestModel(state.latestLiveSignal, state.latestEvaluation);
+    return target !== undefined && model !== null && model.step >= target;
 }
 
 /**

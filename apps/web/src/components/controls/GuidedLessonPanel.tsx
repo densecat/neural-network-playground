@@ -183,7 +183,7 @@ export const GuidedLessonPanel = memo(function GuidedLessonPanel({
             }
 
             if (playground.access.status !== 'ready'
-                || playground.access.prepared !== result.value
+                || playground.access.prepared.identities !== result.value.identities
                 || !mounted.current) return;
             activationModel.current = snapshotModelIdentity(
                 useTrainingStore.getState().latestLiveSignal?.model ?? null,

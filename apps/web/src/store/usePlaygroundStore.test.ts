@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
     DEFAULT_EXPERIMENT_DOCUMENT,
     PREPARED_PRESETS,
+    decodeExperimentUrl,
     encodeExperimentUrl,
     prepareExperimentDocument,
     type ExperimentDocumentV2,
@@ -332,6 +333,33 @@ describe('atomic prepared-document store', () => {
             .toBe(preset('regression-plane').prepared.identities.canonicalRecipeKey);
         expect(current.identities.recipeFingerprint)
             .toBe(preset('regression-plane').prepared.identities.recipeFingerprint);
+    });
+
+    it('updates display flags and their encoded URL during a pending recipe preparation', async () => {
+        const initial = preset('xor-hidden').prepared;
+        const controlled = controlledPreparation();
+        const store = createReadyStore(initial, controlled.prepare);
+        const pending = store.getState().replaceDocument({
+            ...withNoise(initial, 7),
+            view: { ...initial.document.view, discretizeOutput: true },
+        });
+
+        const viewResult = await store.getState().editView((view) => ({ ...view, showTestData: true }));
+        const displayed = readyPrepared(store);
+        expect(viewResult).toEqual({ ok: true, value: displayed });
+        expect(displayed.identities).toBe(initial.identities);
+        expect(displayed.compiled).toBe(initial.compiled);
+        expect(store.getState().runRequestId).toBe(0);
+        expect(store.getState().preparation).toMatchObject({ status: 'preparing', requestId: 1 });
+        expect(controlled.calls).toHaveLength(1);
+        expect(decodeExperimentUrl(window.location.hash)).toEqual({ ok: true, value: displayed.document });
+
+        controlled.resolve(0);
+        const applied = await pending;
+        expect(applied).toEqual({ ok: true, value: readyPrepared(store) });
+        expect(readyPrepared(store).document.view).toEqual({ showTestData: true, discretizeOutput: true });
+        expect(readyPrepared(store).document.recipe.data.noise).toBe(7);
+        expect(store.getState().runRequestId).toBe(1);
     });
 
     it('rejects a fabricated catalog entry whose recipe/prepared pair does not match', async () => {

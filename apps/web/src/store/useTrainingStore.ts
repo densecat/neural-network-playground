@@ -28,6 +28,7 @@ import type { FrameVersions } from '../worker/frameBuffer.ts';
 
 export type ConfigChangeSource = 'data' | 'network' | 'features' | 'training' | 'preset' | 'setup' | null;
 export type TrainedRecipeSource = 'initialize' | 'config-sync' | 'reset' | 'restore';
+export type DatasetStatus = 'loading' | 'ready' | 'error';
 
 export interface PreparedTrainingEvidenceReplacement {
     readonly evidence: WorkerEvidenceMessageV2;
@@ -69,6 +70,8 @@ export interface TrainingStore {
     multiclassBoundaryVersion: number;
     trainPoints: DataPoint[];
     testPoints: DataPoint[];
+    datasetStatus: DatasetStatus;
+    datasetError: string | null;
     /** Steps of training to run per animation frame. */
     stepsPerFrame: number;
     dataConfigLoading: boolean;
@@ -77,6 +80,7 @@ export interface TrainingStore {
     trainingConfigLoading: boolean;
     presetConfigLoading: boolean;
     pendingConfigSource: ConfigChangeSource;
+    runtimeSyncPending: boolean;
     configError: string | null;
     configErrorSource: ConfigChangeSource;
     configSyncNonce: number;
@@ -110,8 +114,8 @@ export interface TrainingStore {
     resetEvidence: () => void;
     setFrameVersion: (version: number) => void;
     setFrameVersions: (versions: FrameVersions) => void;
-    setTrainPoints: (pts: DataPoint[]) => void;
-    setTestPoints: (pts: DataPoint[]) => void;
+    setDatasetLoading: () => void;
+    hydrateDataset: (runId: number, trainPoints: DataPoint[], testPoints: DataPoint[]) => boolean;
     setStepsPerFrame: (n: number) => void;
     beginConfigChange: (source: Exclude<ConfigChangeSource, null>) => void;
     finishConfigChange: () => void;
@@ -136,6 +140,13 @@ const EMPTY_CHECKPOINT_TIMELINE: CheckpointTimeline = {
     liveCheckpointId: null,
     restoredCheckpointId: null,
 };
+
+const LOADING_DATASET = {
+    trainPoints: [],
+    testPoints: [],
+    datasetStatus: 'loading',
+    datasetError: null,
+} satisfies Pick<TrainingStore, 'trainPoints' | 'testPoints' | 'datasetStatus' | 'datasetError'>;
 
 function evidenceGenerationId(message: ReturnType<typeof parseWorkerEvidenceMessageV2>): number {
     if (message.liveSignal) return message.liveSignal.model.generationId;
@@ -163,8 +174,7 @@ export const useTrainingStore = create<TrainingStore>((set, get) => ({
     confusionMatrixVersion: 0,
     activationHistogramsVersion: 0,
     multiclassBoundaryVersion: 0,
-    trainPoints: [],
-    testPoints: [],
+    ...LOADING_DATASET,
     stepsPerFrame: 5,
     dataConfigLoading: false,
     networkConfigLoading: false,
@@ -172,6 +182,7 @@ export const useTrainingStore = create<TrainingStore>((set, get) => ({
     trainingConfigLoading: false,
     presetConfigLoading: false,
     pendingConfigSource: null,
+    runtimeSyncPending: false,
     configError: null,
     configErrorSource: null,
     configSyncNonce: 0,
@@ -214,13 +225,14 @@ export const useTrainingStore = create<TrainingStore>((set, get) => ({
     commitEvidenceReplacement: (prepared) => {
         if (committedEvidenceReplacements.has(prepared)) return;
         prepared.history.commit();
-        set({
+        set((state) => ({
+            ...(state.evidenceGenerationId !== prepared.generationId && LOADING_DATASET),
             evidenceGenerationId: prepared.generationId,
             latestLiveSignal: prepared.evidence.liveSignal ?? null,
             latestEvaluation: prepared.evidence.latestEvaluation ?? null,
             trainingTrendVersion: prepared.history.versions.trendVersion,
             evaluationHistoryVersion: prepared.history.versions.evaluationVersion,
-        });
+        }));
         committedEvidenceReplacements.add(prepared);
     },
     prepareEvidenceAppend: (value) => {
@@ -291,6 +303,7 @@ export const useTrainingStore = create<TrainingStore>((set, get) => ({
     resetEvidence: () => {
         const versions = metricHistoryBuffer.reset();
         set({
+            ...LOADING_DATASET,
             evidenceGenerationId: null,
             latestLiveSignal: null,
             latestEvaluation: null,
@@ -309,8 +322,13 @@ export const useTrainingStore = create<TrainingStore>((set, get) => ({
         activationHistogramsVersion: versions.activationHistogramsVersion,
         multiclassBoundaryVersion: versions.multiclassBoundaryVersion,
     }),
-    setTrainPoints: (trainPoints) => set({ trainPoints }),
-    setTestPoints: (testPoints) => set({ testPoints }),
+    setDatasetLoading: () => set(LOADING_DATASET),
+    hydrateDataset: (runId, trainPoints, testPoints) => {
+        const state = get();
+        if (state.evidenceGenerationId !== runId || state.datasetStatus !== 'loading') return false;
+        set({ trainPoints, testPoints, datasetStatus: 'ready', datasetError: null });
+        return true;
+    },
     setStepsPerFrame: (n) => set({ stepsPerFrame: normalizeTrainingSpeed(n) }),
     beginConfigChange: (source) => set({
         pendingConfigSource: source,
@@ -358,7 +376,10 @@ export const useTrainingStore = create<TrainingStore>((set, get) => ({
             configSyncNonce: state.configSyncNonce + 1,
         };
     }),
-    setWorkerError: (message) => set({ workerError: message }),
+    setWorkerError: (message) => set((state) => ({
+        workerError: message,
+        ...(state.datasetStatus !== 'ready' && { datasetStatus: 'error', datasetError: message }),
+    })),
     clearWorkerError: () => set({ workerError: null }),
     setPauseReason: (pauseReason) => set({ pauseReason }),
     clearPauseReason: () => set({ pauseReason: null }),

@@ -18,6 +18,7 @@ import { usePlaygroundStore } from '../store/usePlaygroundStore.ts';
 import { setHiddenLayers, setSampleCount } from '../store/recipeEdits.ts';
 import { useTrainingStore } from '../store/useTrainingStore.ts';
 import { getFrameBuffer, getFrameVersions, resetFrameBuffer, updateFrameBuffer } from '../worker/frameBuffer.ts';
+import type { WorkerDatasetPointsV2 } from '../worker/training.worker.ts';
 import {
     createScientificTrustFixtures,
     type ScientificTrustFixtures,
@@ -30,9 +31,9 @@ const bridge = vi.hoisted(() => {
         stepExperimentV2: vi.fn(),
         captureCheckpointV2: vi.fn(),
         restoreCheckpointV2: vi.fn(),
+        branchCheckpointV2: vi.fn(),
         getCheckpointTimeline: vi.fn(),
-        getTrainPointsV2: vi.fn(),
-        getTestPointsV2: vi.fn(),
+        getDatasetPointsV2: vi.fn(),
         updateDemand: vi.fn(),
         setStreamPort: vi.fn(),
         setWebGpuEnabled: vi.fn(),
@@ -375,6 +376,17 @@ function currentEvidenceStep(): number | null {
         ?? null;
 }
 
+function makeDatasetPoints(runId: number): WorkerDatasetPointsV2 {
+    const dataset = useTrainingStore.getState().latestEvaluation?.dataset;
+    if (!dataset) throw new Error('expected committed dataset identity');
+    return {
+        runId,
+        dataset,
+        trainPoints: Array.from({ length: dataset.trainCount }, () => ({ x: 0, y: 1, label: 1 })),
+        testPoints: Array.from({ length: dataset.testCount }, () => ({ x: 1, y: 0, label: 0 })),
+    };
+}
+
 function resetStores(): void {
     window.history.replaceState(null, '', '/');
     resetFrameBuffer();
@@ -382,6 +394,7 @@ function resetStores(): void {
     usePlaygroundStore.setState({
         access: { status: 'ready', prepared: INITIAL_PREPARED },
         preparation: { status: 'ready', requestId: 0, issues: [] },
+        urlSyncNotice: null,
         featuresUI: { canvasNetworkGraph: true, webgpuGrid: true },
         demand: { ...DEFAULT_DEMAND },
     });
@@ -484,8 +497,7 @@ describe('useTraining', () => {
             liveCheckpointId: null,
             restoredCheckpointId: null,
         });
-        bridge.workerApi.getTrainPointsV2.mockResolvedValue([{ x: 0, y: 1, label: 1 }]);
-        bridge.workerApi.getTestPointsV2.mockResolvedValue([{ x: 1, y: 0, label: 0 }]);
+        bridge.workerApi.getDatasetPointsV2.mockReset().mockImplementation(makeDatasetPoints);
         bridge.workerApi.updateDemand.mockResolvedValue(undefined);
         bridge.workerApi.setWebGpuEnabled.mockResolvedValue(undefined);
         bridge.setupStreamChannel.mockResolvedValue(undefined);
@@ -538,17 +550,27 @@ describe('useTraining', () => {
     });
 
     it('initializes the worker and hydrates runtime state on mount', async () => {
+        const hydratedSplits: Array<[number, number]> = [];
+        const unsubscribe = useTrainingStore.subscribe(({ trainPoints, testPoints }) => {
+            if (trainPoints.length || testPoints.length) {
+                hydratedSplits.push([trainPoints.length, testPoints.length]);
+            }
+        });
         renderHook(() => useTraining());
 
         await waitFor(() => expect(bridge.workerApi.initializeExperimentV2).toHaveBeenCalledTimes(1));
-        await waitFor(() => expect(currentEvidenceStep()).toBe(0));
+        await waitFor(() => expect(useTrainingStore.getState().datasetStatus).toBe('ready'));
+        unsubscribe();
 
         expect(bridge.newRunTo).toHaveBeenCalledWith(1);
         expect(bridge.setupStreamChannel).toHaveBeenCalledTimes(1);
         expect(bridge.workerApi.updateDemand).toHaveBeenCalledWith(DEFAULT_DEMAND);
         expect(bridge.workerApi.setWebGpuEnabled).toHaveBeenCalledWith(true);
-        expect(useTrainingStore.getState().trainPoints).toEqual([{ x: 0, y: 1, label: 1 }]);
-        expect(useTrainingStore.getState().testPoints).toEqual([{ x: 1, y: 0, label: 0 }]);
+        const { trainPoints, testPoints, dataset } = makeDatasetPoints(1);
+        expect(useTrainingStore.getState().trainPoints).toEqual(trainPoints);
+        expect(useTrainingStore.getState().testPoints).toEqual(testPoints);
+        expect(hydratedSplits).toEqual([[dataset.trainCount, dataset.testCount]]);
+        expect(bridge.workerApi.getDatasetPointsV2).toHaveBeenCalledExactlyOnceWith(1, dataset.datasetKey);
         expect(useTrainingStore.getState().paramsVersion).toBeGreaterThan(0);
         expect(useTrainingStore.getState().trainedRecipe?.task.dataset).toBe(DEFAULT_DATA.dataset);
         expect(useTrainingStore.getState().trainedRecipeFingerprint)
@@ -626,6 +648,40 @@ describe('useTraining', () => {
         expect(request.claimedIdentities).toBe(appliedPrepared.identities);
         expect(bridge.newRunTo).toHaveBeenLastCalledWith(2);
         expect(useTrainingStore.getState().trainedRecipeSource).toBe('config-sync');
+    });
+
+    it.each(['running', 'paused'] as const)('preserves a %s run across both display edits', async (status) => {
+        const { result } = renderHook(() => useTraining());
+        await waitFor(() => expect(useTrainingStore.getState().datasetStatus).toBe('ready'));
+        await act(() => result.current.step());
+        act(() => result.current.play());
+        if (status === 'paused') {
+            act(() => result.current.pause());
+            act(() => getStreamHandler()({ type: 'status', protocolVersion: 2, runId: 1, status: 'paused' }));
+        }
+        const before = useTrainingStore.getState();
+        expect(before.status).toBe(status);
+        expect(currentEvidenceStep()).toBe(4);
+        bridge.postStreamCommand.mockClear();
+
+        await act(async () => {
+            const store = usePlaygroundStore.getState();
+            await store.editView((view) => ({ ...view, showTestData: true }));
+            await store.editView((view) => ({ ...view, discretizeOutput: true }));
+        });
+
+        const after = useTrainingStore.getState();
+        expect(after.status).toBe(status);
+        expect(after.evidenceGenerationId).toBe(before.evidenceGenerationId);
+        expect(after.checkpointTimeline).toBe(before.checkpointTimeline);
+        expect(after.latestEvaluation).toBe(before.latestEvaluation);
+        expect(after.evaluationHistoryVersion).toBe(before.evaluationHistoryVersion);
+        expect(after.trainingTrendVersion).toBe(before.trainingTrendVersion);
+        expect(after.trainPoints).toBe(before.trainPoints);
+        expect(after.testPoints).toBe(before.testPoints);
+        expect(bridge.workerApi.initializeExperimentV2).toHaveBeenCalledTimes(1);
+        expect(bridge.workerApi.getDatasetPointsV2).toHaveBeenCalledTimes(1);
+        expect(bridge.postStreamCommand).not.toHaveBeenCalled();
     });
 
     it('hydrates fresh worker snapshots in the existing store update order', async () => {
@@ -1337,6 +1393,40 @@ describe('useTraining', () => {
         expect(useTrainingStore.getState().pauseReason).toBe('manual');
     });
 
+    it('applies a branch and its step budget in the current generation', async () => {
+        const { result } = renderHook(() => useTraining());
+        await waitFor(() => expect(currentEvidenceStep()).toBe(0));
+        act(() => useTrainingStore.getState().applyEvidence(makeEvidence(1, 2, 1, 'manual-step')));
+        const resultFixture = makeV2Result(1, 0, 3, 'restore', makeSnapshot(0), INITIAL_PREPARED, 2);
+        const source = {
+            ...resultFixture.checkpointTimeline.checkpoints[0],
+            trajectoryGuarantee: 'same-recipe-training-trajectory' as const,
+        };
+        const branched = {
+            ...resultFixture,
+            checkpointTimeline: {
+                ...resultFixture.checkpointTimeline,
+                checkpoints: [source, { ...source, id: 2, step: 1, label: 'Step 1' }],
+                liveCheckpointId: 2,
+                restoredCheckpointId: null,
+                branch: { sourceCheckpointId: 1, previousCheckpointId: 2, targetStep: 7 },
+            },
+        };
+        bridge.workerApi.branchCheckpointV2.mockResolvedValueOnce(branched);
+
+        await act(async () => result.current.branchCheckpoint(1, 7));
+
+        expect(bridge.workerApi.branchCheckpointV2).toHaveBeenCalledWith({
+            type: 'branch-checkpoint', protocolVersion: 2, requestId: expect.any(Number),
+            checkpointId: 1, trainingSteps: 7,
+        });
+        expect(bridge.workerApi.restoreCheckpointV2).not.toHaveBeenCalled();
+        expect(bridge.newRunTo).toHaveBeenCalledTimes(1);
+        expect(useTrainingStore.getState().checkpointTimeline).toEqual(branched.checkpointTimeline);
+        expect(useTrainingStore.getState().status).toBe('paused');
+        expect(currentEvidenceStep()).toBe(0);
+    });
+
     it('rejects forged restore metadata before changing evidence, frame, or timeline', async () => {
         const { result } = renderHook(() => useTraining());
         await waitFor(() => expect(currentEvidenceStep()).toBe(0));
@@ -1460,6 +1550,41 @@ describe('useTraining', () => {
         expect(useTrainingStore.getState().trainedRecipeSource).toBe('config-sync');
 
         unmount();
+    });
+
+    it('keeps Step available when updating the setup link fails after a config commit', async () => {
+        const { result } = renderHook(() => useTraining());
+        await waitFor(() => expect(useTrainingStore.getState().datasetStatus).toBe('ready'));
+        const replaceState = vi.spyOn(window.history, 'replaceState').mockImplementationOnce(() => {
+            throw new DOMException('History updates unavailable', 'SecurityError');
+        });
+        const targetCount = DEFAULT_DATA.numSamples + 1;
+
+        await act(async () => {
+            useTrainingStore.getState().beginConfigChange('data');
+            const edited = await usePlaygroundStore.getState().editRecipe(
+                (recipe) => setSampleCount(recipe, targetCount),
+            );
+            expect(edited.ok).toBe(true);
+        });
+
+        await waitFor(() => expect(useTrainingStore.getState().pendingConfigSource).toBeNull());
+        expect(replaceState).toHaveBeenCalledTimes(1);
+        replaceState.mockRestore();
+        expect(useTrainingStore.getState()).toMatchObject({
+            evidenceGenerationId: 2, workerError: null, configError: null, datasetStatus: 'ready',
+        });
+        expect(usePlaygroundStore.getState().urlSyncNotice).toMatch(/setup link could not be updated/i);
+        const access = usePlaygroundStore.getState().access;
+        if (access.status !== 'ready') throw new Error('expected ready access');
+        bridge.workerApi.stepExperimentV2.mockResolvedValueOnce(makeV2Result(
+            2, 4, 2, 'manual-step', makeSnapshot(4, access.prepared.compiled.network), access.prepared,
+        ));
+        await act(() => result.current.step());
+        expect(currentEvidenceStep()).toBe(4);
+        expect(bridge.workerApi.initializeExperimentV2).toHaveBeenCalledTimes(2);
+        expect(usePlaygroundStore.getState().syncToUrl().ok).toBe(true);
+        expect(usePlaygroundStore.getState().urlSyncNotice).toBeNull();
     });
 
     it('records config sync failures and keeps the previous config snapshot retryable', async () => {
@@ -1607,7 +1732,7 @@ describe('useTraining', () => {
         bridge.workerApi.initializeExperimentV2.mockImplementationOnce(
             (request: WorkerExperimentRequestV2) => makeV2ResultForRequest(2, request),
         );
-        bridge.workerApi.getTrainPointsV2.mockRejectedValueOnce(new Error('points hydration failed'));
+        bridge.workerApi.getDatasetPointsV2.mockRejectedValueOnce(new Error('points hydration failed'));
 
         await act(async () => {
             useTrainingStore.getState().beginConfigChange('data');
@@ -1630,6 +1755,23 @@ describe('useTraining', () => {
         expect(useTrainingStore.getState().configError).toBeNull();
         expect(useTrainingStore.getState().pendingConfigSource).toBeNull();
         expect(useTrainingStore.getState().status).toBe('paused');
+        expect(useTrainingStore.getState().datasetStatus).toBe('error');
+        expect(useTrainingStore.getState().datasetError).toBe('points hydration failed');
+    });
+
+    it('rejects a foreign split response without publishing either split', async () => {
+        bridge.workerApi.getDatasetPointsV2.mockImplementationOnce((runId: number) => ({
+            ...makeDatasetPoints(runId),
+            runId: runId + 1,
+        }));
+        renderHook(() => useTraining());
+        await waitFor(() => expect(useTrainingStore.getState().datasetStatus).toBe('error'));
+        expect(useTrainingStore.getState()).toMatchObject({
+            evidenceGenerationId: 1,
+            datasetError: 'dataset points do not match the active experiment',
+            trainPoints: [],
+            testPoints: [],
+        });
     });
 
     it('drops a manual-step completion after a prepared generation wins', async () => {
@@ -2090,7 +2232,7 @@ describe('useTraining', () => {
     });
 
     it('keeps the stream channel live when prepared changes during mount hydration', async () => {
-        const stalePoints = deferred<Array<{ x: number; y: number; label: number }>>();
+        const stalePoints = deferred<WorkerDatasetPointsV2>();
         bridge.workerApi.initializeExperimentV2
             .mockReset()
             .mockImplementationOnce((request: WorkerExperimentRequestV2) => (
@@ -2099,13 +2241,12 @@ describe('useTraining', () => {
             .mockImplementationOnce((request: WorkerExperimentRequestV2) => (
                 makeV2ResultForRequest(2, request)
             ));
-        bridge.workerApi.getTrainPointsV2
-            .mockReset()
-            .mockReturnValueOnce(stalePoints.promise)
-            .mockResolvedValue([]);
+        bridge.workerApi.getDatasetPointsV2.mockReturnValueOnce(stalePoints.promise);
         const { result } = renderHook(() => useTraining());
-        await waitFor(() => expect(bridge.workerApi.getTrainPointsV2).toHaveBeenCalledTimes(1));
+        await waitFor(() => expect(bridge.workerApi.getDatasetPointsV2).toHaveBeenCalledTimes(1));
         expect(currentEvidenceStep()).toBe(0);
+        expect(useTrainingStore.getState().datasetStatus).toBe('loading');
+        const firstDataset = makeDatasetPoints(1);
 
         await act(async () => {
             useTrainingStore.getState().beginConfigChange('data');
@@ -2141,10 +2282,17 @@ describe('useTraining', () => {
         expect(useTrainingStore.getState().evidenceGenerationId).toBe(2);
 
         await act(async () => {
-            stalePoints.resolve([{ x: 9, y: 9, label: 1 }]);
+            stalePoints.resolve({
+                ...firstDataset,
+                trainPoints: firstDataset.trainPoints.map((point) => ({ ...point, x: 9 })),
+            });
             await stalePoints.promise;
         });
-        expect(useTrainingStore.getState().trainPoints).toEqual([]);
+        expect(useTrainingStore.getState().datasetStatus).toBe('ready');
+        const currentDataset = makeDatasetPoints(2);
+        expect(useTrainingStore.getState().trainPoints).toEqual(currentDataset.trainPoints);
+        expect(useTrainingStore.getState().testPoints).toEqual(currentDataset.testPoints);
+        expect(useTrainingStore.getState().workerError).toBeNull();
     });
 
     it('does not apply initialization completion after unmount', async () => {

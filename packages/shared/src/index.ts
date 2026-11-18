@@ -20,10 +20,13 @@ export {
 } from './serialization.js';
 export {
     SESSION_CHECKPOINT_MAX_TYPED_ARRAY_BYTES,
+    validateSessionCheckpoint,
     validateSessionCheckpointV2,
 } from './sessionCheckpoint.js';
 export type {
+    SessionCheckpoint,
     SessionCheckpointV2,
+    SessionCheckpointV3,
     SessionOptimizerStateV2,
     SessionCheckpointValidationContext,
 } from './sessionCheckpoint.js';
@@ -116,8 +119,10 @@ export type {
 } from './experimentMemory.js';
 export {
     DEFAULT_DEMAND,
+    MAX_CHECKPOINT_BRANCH_STEPS,
     WORKER_PROTOCOL_VERSION,
     isCaptureCheckpointRequestV2,
+    isCheckpointBranchStepCount,
     isRestoreCheckpointRequestV2,
     isCaptureRunArtifactRequestV2,
     isCaptureRunRequestV2,
@@ -166,6 +171,7 @@ export type {
     CaptureRunRequestV2,
     CaptureRunArtifactRequestV2,
     CaptureCheckpointRequestV2,
+    BranchCheckpointRequestV2,
     RestoreCheckpointRequestV2,
     MainToWorkerRequestV2,
     WorkerArtifactProvenanceV2,

@@ -44,7 +44,7 @@ import {
     parseCaptureRunArtifactRequestV2,
     parseMainToWorkerRequestV2,
     parseCheckpointTimelineV2,
-    validateSessionCheckpointV2,
+    validateSessionCheckpoint,
     validateExperimentRunRecordV2,
     compactEvenly,
     EXPERIMENT_MEMORY_MAX_EVALUATIONS,
@@ -73,7 +73,8 @@ import type {
     WorkerArtifactProvenanceV2,
     CaptureRunArtifactRequestV2,
     ExperimentRunRecordV2,
-    SessionCheckpointV2,
+    SessionCheckpoint,
+    BranchCheckpointRequestV2,
     CaptureCheckpointRequestV2,
     RestoreCheckpointRequestV2,
     ModelRevision,
@@ -103,6 +104,7 @@ import {
     EvaluationRuntime,
     TerminalDivergenceError,
     type PreparedCadenceEvaluation,
+    type PreparedCheckpointEvaluation,
 } from './evaluationRuntime.ts';
 import {
     RuntimeMetricHistory,
@@ -159,6 +161,7 @@ interface WorkerState {
     nextCheckpointId: number;
     checkpointEvictedCount: number;
     restoredCheckpointId: number | null;
+    branch: CheckpointTimeline['branch'];
     /** Runtime-only stop-condition tracking. Reset on new worker runs/rebuilds. */
     stopConditionState: StopConditionState;
     /** Monotonic identity for confusion matrix payload freshness. */
@@ -226,8 +229,12 @@ interface WorkerState {
 interface V2RuntimeCheckpoint {
     kind: 'v2';
     summary: CheckpointSummary;
-    checkpoint: SessionCheckpointV2;
+    checkpoint: SessionCheckpoint;
 }
+
+type CheckpointRing = Pick<WorkerState,
+    'checkpoints' | 'nextCheckpointId' | 'checkpointEvictedCount' | 'restoredCheckpointId' | 'branch'
+>;
 
 export type PredictionTraceSampleSource = 'train' | 'test';
 
@@ -399,6 +406,7 @@ const state: WorkerState = {
     nextCheckpointId: 1,
     checkpointEvictedCount: 0,
     restoredCheckpointId: null,
+    branch: undefined,
     stopConditionState: createInitialStopConditionState(),
     confusionMatrixVersion: 0,
     multiclassConfusionMatrixVersion: 0,
@@ -425,13 +433,14 @@ const state: WorkerState = {
     awaitingAck: false,
 };
 
-function buildCheckpointTimeline(): CheckpointTimeline {
+function buildCheckpointTimeline(ring: CheckpointRing = state): CheckpointTimeline {
     const timeline = {
-        checkpoints: state.checkpoints.map((entry) => ({ ...entry.summary })),
+        checkpoints: ring.checkpoints.map((entry) => ({ ...entry.summary })),
         maxCheckpoints: CHECKPOINT_MAX_COUNT,
-        evictedCount: state.checkpointEvictedCount,
-        liveCheckpointId: state.checkpoints.at(-1)?.summary.id ?? null,
-        restoredCheckpointId: state.restoredCheckpointId,
+        evictedCount: ring.checkpointEvictedCount,
+        liveCheckpointId: ring.checkpoints.at(-1)?.summary.id ?? null,
+        restoredCheckpointId: ring.restoredCheckpointId,
+        ...(ring.branch === undefined ? {} : { branch: ring.branch }),
     };
     return parseCheckpointTimelineV2(timeline);
 }
@@ -441,6 +450,7 @@ function resetCheckpoints(): void {
     state.nextCheckpointId = 1;
     state.checkpointEvictedCount = 0;
     state.restoredCheckpointId = null;
+    state.branch = undefined;
 }
 
 // ── Scientific-trust V2 runtime ────────────────────────────────────────────
@@ -453,6 +463,13 @@ export interface WorkerExperimentResultV2 {
     readonly artifacts?: WorkerArtifactProvenanceV2;
     readonly layerStatsGradientRevision?: number;
     readonly checkpointTimeline: CheckpointTimeline;
+}
+
+export interface WorkerDatasetPointsV2 {
+    readonly runId: number;
+    readonly dataset: DatasetRevision;
+    readonly trainPoints: DataPoint[];
+    readonly testPoints: DataPoint[];
 }
 
 function checkpointValidationContext() {
@@ -474,17 +491,17 @@ function checkpointValidationContext() {
 }
 
 function prepareV2CheckpointEntry(evaluation: PairedEvaluation): V2RuntimeCheckpoint {
-    const { prepared, compiled, datasetRevision, network } = state;
-    if (!prepared || !compiled || !datasetRevision || !network) {
+    const { prepared, compiled, datasetRevision, network, shufflePrng } = state;
+    if (!prepared || !compiled || !datasetRevision || !network || !shufflePrng) {
         throw new Error('V2 experiment is not initialized');
     }
     if (evaluation.model.generationId !== state.runId) {
         throw new RangeError('checkpoint model generation must equal the active generation');
     }
     const session = network.captureSessionState(compiled.training.optimizer);
-    const validated = validateSessionCheckpointV2({
+    const validated = validateSessionCheckpoint({
         kind: 'nn-playground-session-checkpoint',
-        schemaVersion: 2,
+        schemaVersion: 3,
         recipeFingerprint: prepared.identities.recipeFingerprint,
         objectiveKey: prepared.identities.objectiveKey,
         datasetKey: datasetRevision.datasetKey,
@@ -496,8 +513,9 @@ function prepareV2CheckpointEntry(evaluation: PairedEvaluation): V2RuntimeCheckp
             epoch: state.epoch,
             batchStart: state.batchStart,
             shuffledIndices: Uint32Array.from(state.shuffledIndices),
+            shufflePrngState: shufflePrng.captureState(),
         },
-        trajectoryGuarantee: 'parameters-and-optimizer-only',
+        trajectoryGuarantee: 'same-recipe-training-trajectory',
     }, checkpointValidationContext());
 
     const id = state.nextCheckpointId;
@@ -507,6 +525,7 @@ function prepareV2CheckpointEntry(evaluation: PairedEvaluation): V2RuntimeCheckp
         epoch: evaluation.model.epoch,
         trainDataLoss: evaluation.train.values.dataLoss,
         testDataLoss: evaluation.test.values.dataLoss,
+        trajectoryGuarantee: validated.trajectoryGuarantee,
         ...(evaluation.train.values.accuracy === undefined
             ? {}
             : { trainAccuracy: evaluation.train.values.accuracy }),
@@ -520,16 +539,30 @@ function prepareV2CheckpointEntry(evaluation: PairedEvaluation): V2RuntimeCheckp
     return entry;
 }
 
-function commitV2CheckpointEntry(entry: V2RuntimeCheckpoint): void {
-    state.nextCheckpointId++;
-    state.checkpoints.push(entry);
-    while (state.checkpoints.length > CHECKPOINT_MAX_COUNT) {
-        const evicted = state.checkpoints.shift();
-        state.checkpointEvictedCount++;
-        if (evicted && state.restoredCheckpointId === evicted.summary.id) {
-            state.restoredCheckpointId = null;
-        }
+function appendCheckpointToRing(ring: CheckpointRing, entry: V2RuntimeCheckpoint): CheckpointRing {
+    const { branch } = ring;
+    const checkpoints = [...ring.checkpoints, entry];
+    let checkpointEvictedCount = ring.checkpointEvictedCount;
+    let restoredCheckpointId = ring.restoredCheckpointId;
+    if (checkpoints.length > CHECKPOINT_MAX_COUNT) {
+        const oldestUnprotectedIndex = checkpoints.findIndex(({ summary }) => (
+            summary.id !== branch?.sourceCheckpointId && summary.id !== branch?.previousCheckpointId
+        ));
+        const [evicted] = checkpoints.splice(oldestUnprotectedIndex, 1);
+        checkpointEvictedCount++;
+        if (restoredCheckpointId === evicted.summary.id) restoredCheckpointId = null;
     }
+    return {
+        checkpoints,
+        nextCheckpointId: ring.nextCheckpointId + 1,
+        checkpointEvictedCount,
+        restoredCheckpointId,
+        branch,
+    };
+}
+
+function commitV2CheckpointEntry(entry: V2RuntimeCheckpoint): void {
+    Object.assign(state, appendCheckpointToRing(state, entry));
 }
 
 function appendV2Checkpoint(evaluation: PairedEvaluation): V2RuntimeCheckpoint {
@@ -592,7 +625,7 @@ function resolvePendingCadenceBeforeTrainingV2(
 }
 
 /** Narrow module-only seam for validating worker-private checkpoint transactions. */
-export function getV2CheckpointForTests(id: number): SessionCheckpointV2 {
+export function getV2CheckpointForTests(id: number): SessionCheckpoint {
     const entry = state.checkpoints.find((candidate) => candidate.summary.id === id);
     if (!entry || entry.kind !== 'v2') throw new RangeError('V2 checkpoint not found');
     return structuredClone(entry.checkpoint);
@@ -607,7 +640,8 @@ export function getV2CheckpointTimelineForTests(): CheckpointTimeline {
 export function replaceV2CheckpointForTests(id: number, checkpoint: unknown): void {
     const entry = state.checkpoints.find((candidate) => candidate.summary.id === id);
     if (!entry || entry.kind !== 'v2') throw new RangeError('V2 checkpoint not found');
-    entry.checkpoint = checkpoint as SessionCheckpointV2;
+    entry.checkpoint = checkpoint as SessionCheckpoint;
+    entry.summary.trajectoryGuarantee = entry.checkpoint.trajectoryGuarantee;
 }
 
 interface V2RuntimeBuild {
@@ -2095,9 +2129,8 @@ function trainOneStepV2(): {
     if (sampleCount === 0) return undefined;
 
     if (state.batchStart === sampleCount) {
-        // The boundary sentinel already records the completed epoch. Future
-        // shuffle PRNG state is intentionally not checkpointed, so normalize
-        // only when the next batch is actually requested.
+        // The boundary sentinel already records the completed epoch. Advance
+        // the shuffle stream only when the next batch is actually requested.
         state.batchStart = 0;
         state.shufflePrng?.shuffle(state.shuffledIndices);
     }
@@ -2191,17 +2224,21 @@ interface SnapshotPipelineIdentity {
     readonly network: Network | null;
 }
 
-async function produceAndPostSnapshot(identity: SnapshotPipelineIdentity): Promise<void> {
+async function produceAndPostSnapshot(
+    identity: SnapshotPipelineIdentity,
+    branchComplete = false,
+): Promise<void> {
     if (!state.streamPort) return;
 
     // GPU grid pre-fill (AS-4). When enabled + capable + due, this
     // populates state.outputGridBuffer / state.neuronGridsBuffer; the
     // synchronous computeSnapshot below detects the freshly-filled
     // buffers via state.gridFreshFromGpu and skips its CPU branch.
-    await runGpuGridIfDue();
+    if (!branchComplete) await runGpuGridIfDue();
     // An awaited predecessor must never continue packing against a replacement
     // generation or interfere with its independent backpressure lifecycle.
     if (state.runId !== identity.runId || state.network !== identity.network) return;
+    if (!branchComplete && limitStepsToBranchBudget(1) === 0) return;
 
     // Live evidence is transport-coalesced to one current signal per visual
     // frame. Worker history still contains every batch (see trainOneStepV2).
@@ -2211,7 +2248,7 @@ async function produceAndPostSnapshot(identity: SnapshotPipelineIdentity): Promi
     }
 
     let stopEvaluation: ReturnType<typeof evaluateStopConditions> | null = null;
-    if (state.running && state.network && state.evaluationRuntime) {
+    if ((state.running || branchComplete) && state.network && state.evaluationRuntime) {
         const model = {
             generationId: state.runId,
             revision: state.network.getRevision(),
@@ -2224,7 +2261,7 @@ async function produceAndPostSnapshot(identity: SnapshotPipelineIdentity): Promi
             && currentEvaluation.model.revision === model.revision
             && currentEvaluation.model.step === model.step
             && currentEvaluation.model.epoch === model.epoch;
-        if (stopConditionsRequireCurrentEvaluation(runtimeStopConditions)
+        if ((branchComplete || stopConditionsRequireCurrentEvaluation(runtimeStopConditions))
             && !evaluationIsCurrent) {
             try {
                 currentEvaluation = forceAndPublishEvaluationV2('stop-condition');
@@ -2265,7 +2302,9 @@ async function produceAndPostSnapshot(identity: SnapshotPipelineIdentity): Promi
         () => packSnapshotMessage(snap),
     );
     state.streamPort.postMessage(message, transferables);
-    const pauseReason = stopEvaluation?.pauseReason ?? null;
+    const pauseReason = branchComplete && stopEvaluation?.pauseReason !== 'diverged'
+        ? 'max-steps'
+        : stopEvaluation?.pauseReason ?? null;
     if (pauseReason) {
         stopInternalLoop();
         postStatus('paused', pauseReason);
@@ -2282,12 +2321,18 @@ function trainTick(): void {
             // Keep the selected speed literal: each scheduled tick advances
             // by a bounded number of steps, then yields so pause/update
             // commands can be processed before more work starts.
-            const burst = getTrainingStepsForTick(state.stepsPerFrame);
+            const burst = limitStepsToBranchBudget(getTrainingStepsForTick(state.stepsPerFrame));
             for (let i = 0; i < burst && state.running; i++) {
                 trainOneStepV2();
             }
 
             workerPerfMeasure('perf:worker:trainStep', 'perf:worker:trainStep:start');
+            const branchComplete = limitStepsToBranchBudget(1) === 0;
+            if (branchComplete) {
+                stopInternalLoop();
+                state.snapshotsSinceLastGrid = state.demand.gridInterval;
+                state.snapshotsSinceLastActivationHistogram = state.demand.activationHistogramInterval;
+            }
 
             // Back-pressure: skip snapshot computation + posting while the main
             // thread hasn't yet applied the previous frame. Training still
@@ -2301,9 +2346,10 @@ function trainTick(): void {
                     runId: state.runId,
                     network: state.network,
                 };
-                produceAndPostSnapshot(pipelineIdentity).catch((err) => {
+                produceAndPostSnapshot(pipelineIdentity, branchComplete).catch((err) => {
                     if (state.runId !== pipelineIdentity.runId
                         || state.network !== pipelineIdentity.network) return;
+                    if (!branchComplete && limitStepsToBranchBudget(1) === 0) return;
                     state.awaitingAck = false;
                     stopInternalLoop();
                     if (err instanceof TerminalDivergenceError) {
@@ -2326,6 +2372,12 @@ function trainTick(): void {
             postRuntimeErrorV2(err, 'training');
         }
     }
+}
+
+function limitStepsToBranchBudget(requestedSteps: number): number {
+    const target = state.branch?.targetStep;
+    if (target === undefined || state.network === null) return requestedSteps;
+    return Math.min(requestedSteps, Math.max(0, target - state.network.getStep()));
 }
 
 function startInternalLoop(): void {
@@ -2408,6 +2460,10 @@ function handleStreamCommand(cmd: unknown): void {
             case 'startTraining':
                 runOrQueueV2StreamMutation(() => {
                     requireV2Runtime();
+                    if (limitStepsToBranchBudget(1) === 0) {
+                        postStatus('paused', 'max-steps');
+                        return;
+                    }
                     state.stepsPerFrame = normalizeTrainingSpeed(cmd.stepsPerFrame);
                     startInternalLoop();
                     postStatus('running');
@@ -2623,13 +2679,18 @@ function stepExperimentV2Now(iterations: number): WorkerExperimentResultV2 {
         }
         requireV2Runtime();
         let latestLive: LiveTrainingSignal | undefined;
-        for (let index = 0; index < iterations; index++) {
+        const boundedIterations = limitStepsToBranchBudget(iterations);
+        for (let index = 0; index < boundedIterations; index++) {
             latestLive = trainOneStepV2()?.liveSignal ?? latestLive;
         }
         const evaluation = forceAndPublishEvaluationV2('manual-step', false);
         const evidence = makeEvidenceV2(latestLive, evaluation);
         postEvidenceV2(evidence);
         const snapshot = computeSnapshot();
+        if (limitStepsToBranchBudget(1) === 0) {
+            stopInternalLoop();
+            postStatus('paused', 'max-steps');
+        }
         return {
             snapshot,
             runId: state.runId,
@@ -2750,10 +2811,11 @@ function captureCheckpointV2Now(): WorkerExperimentResultV2 {
 }
 
 function prepareRestoreCandidate(
-    checkpoint: SessionCheckpointV2,
-    checkpointId: number,
+    checkpoint: SessionCheckpoint,
+    ring: CheckpointRing,
     prospectiveRevision: number,
     runtime: EvaluationRuntime,
+    previousCheckpointEvaluation?: PreparedCheckpointEvaluation,
 ): {
     readonly network: Network;
     readonly snapshot: NetworkSnapshot;
@@ -2771,6 +2833,7 @@ function prepareRestoreCandidate(
     candidate.restoreSessionState(
         { network: checkpoint.network, optimizer: checkpoint.optimizer },
         compiled.training.optimizer,
+        // The engine uses the next training step as the learning-rate scheduler cursor.
         checkpoint.model.step,
         prospectiveRevision,
     );
@@ -2793,7 +2856,7 @@ function prepareRestoreCandidate(
         model: restoredModel,
         getCurrentModel: readCandidateModel,
         ...computation,
-    });
+    }, previousCheckpointEvaluation);
     const capturedScientificValues = {
         dataset: checkpoint.evaluation.dataset,
         objectiveKey: checkpoint.evaluation.objectiveKey,
@@ -2820,10 +2883,7 @@ function prepareRestoreCandidate(
         objectiveKey: prepared.identities.objectiveKey,
     });
     replacementHistory.appendEvaluation(preparedEvaluation.evaluation);
-    const checkpointTimeline = parseCheckpointTimelineV2({
-        ...buildCheckpointTimeline(),
-        restoredCheckpointId: checkpointId,
-    });
+    const checkpointTimeline = buildCheckpointTimeline(ring);
 
     // A temporary runtime lets computeSnapshot exercise the exact demanded
     // artifact path without touching the active EvaluationRuntime.
@@ -2854,16 +2914,19 @@ function prepareRestoreCandidate(
         state.epoch = checkpoint.cursor.epoch;
         state.batchStart = checkpoint.cursor.batchStart;
         state.shuffledIndices = Array.from(checkpoint.cursor.shuffledIndices);
+        if (checkpoint.schemaVersion === 3) {
+            state.shufflePrng = new PRNG(checkpoint.cursor.shufflePrngState);
+        }
         state.running = false;
-        clearTrainLoopTimer();
+        state.trainLoopTimer = null;
         state.gpuPredictor = null;
         state.sharedViews = null;
-        state.restoredCheckpointId = checkpointId;
         resetRestoreDerivedState(candidate);
         snapshot = computeSnapshot();
         artifacts = directSnapshotArtifactBundle(snapshot);
         nextState = {
             ...state,
+            ...ring,
             evaluationRuntime: runtime,
             metricHistory: replacementHistory,
             v2EpochRef,
@@ -2914,14 +2977,16 @@ function resetRestoreDerivedState(network: Network): void {
     resetAck();
 }
 
-function restoreCheckpointV2Now(request: RestoreCheckpointRequestV2): WorkerExperimentResultV2 {
+function navigateCheckpointV2Now(
+    request: RestoreCheckpointRequestV2 | BranchCheckpointRequestV2,
+): WorkerExperimentResultV2 {
     try {
         const { network, runtime, epochRef } = requireV2Runtime();
         const entry = state.checkpoints.find(
             (candidate) => candidate.summary.id === request.checkpointId,
         );
         if (!entry || entry.kind !== 'v2') throw new RangeError('V2 checkpoint not found');
-        const checkpoint = validateSessionCheckpointV2(
+        const checkpoint = validateSessionCheckpoint(
             entry.checkpoint,
             checkpointValidationContext(),
         );
@@ -2930,12 +2995,44 @@ function restoreCheckpointV2Now(request: RestoreCheckpointRequestV2): WorkerExpe
         }
 
         const previousRevision = network.getRevision();
-        const prospectiveRevision = previousRevision + 1;
+        let originalEvaluation: PreparedCheckpointEvaluation | undefined;
+        let ring: CheckpointRing = {
+            checkpoints: state.checkpoints,
+            nextCheckpointId: state.nextCheckpointId,
+            checkpointEvictedCount: state.checkpointEvictedCount,
+            restoredCheckpointId: request.checkpointId,
+            branch: undefined,
+        };
+        if (request.type === 'branch-checkpoint') {
+            if (checkpoint.schemaVersion !== 3) {
+                throw new RangeError('A reproducible branch requires a checkpoint with saved shuffle state.');
+            }
+            const savedOriginal = state.checkpoints.find(({ checkpoint: saved }) => (
+                saved.schemaVersion === 3 && saved.model.revision === previousRevision
+            ));
+            ring.restoredCheckpointId = null;
+            const targetStep = request.trainingSteps === undefined
+                ? undefined
+                : checkpoint.model.step + request.trainingSteps;
+            if (targetStep !== undefined && !Number.isSafeInteger(targetStep)) {
+                throw new RangeError('Branch target exceeds the training step range.');
+            }
+            ring.branch = {
+                sourceCheckpointId: request.checkpointId,
+                previousCheckpointId: savedOriginal?.summary.id ?? state.nextCheckpointId,
+                ...(targetStep === undefined ? {} : { targetStep }),
+            };
+            if (savedOriginal === undefined) {
+                originalEvaluation = runtime.prepareCheckpointEvaluation();
+                ring = appendCheckpointToRing(ring, prepareV2CheckpointEntry(originalEvaluation.evaluation));
+            }
+        }
         const prepared = prepareRestoreCandidate(
             checkpoint,
-            request.checkpointId,
-            prospectiveRevision,
+            ring,
+            previousRevision + 1,
             runtime,
+            originalEvaluation,
         );
 
         // All scientific computation and allocation happened above. Commit
@@ -2951,7 +3048,7 @@ function restoreCheckpointV2Now(request: RestoreCheckpointRequestV2): WorkerExpe
         Object.assign(state, prepared.nextState);
         state.epoch = checkpoint.cursor.epoch;
         state.batchStart = checkpoint.cursor.batchStart;
-        postEvidenceV2(prepared.evidence);
+        if (request.type === 'restore-checkpoint') postEvidenceV2(prepared.evidence);
         return {
             snapshot: prepared.snapshot,
             runId: state.runId,
@@ -3033,21 +3130,39 @@ export const workerApi = {
             postRuntimeErrorV2(error, 'checkpoint', 'checkpoint-failed');
             return Promise.reject(error);
         }
-        return enqueueV2Mutation(() => restoreCheckpointV2Now(parsed));
+        return enqueueV2Mutation(() => navigateCheckpointV2Now(parsed));
+    },
+
+    branchCheckpointV2(request: unknown): Promise<WorkerExperimentResultV2> {
+        let parsed: BranchCheckpointRequestV2;
+        try {
+            const candidate = parseMainToWorkerRequestV2(request);
+            if (candidate.type !== 'branch-checkpoint') {
+                throw new TypeError('branch checkpoint request has the wrong discriminator');
+            }
+            parsed = candidate;
+        } catch (error) {
+            postRuntimeErrorV2(error, 'checkpoint', 'checkpoint-failed');
+            return Promise.reject(error);
+        }
+        return enqueueV2Mutation(() => navigateCheckpointV2Now(parsed));
     },
 
     getMetricHistoryV2(): RuntimeMetricHistorySnapshot {
         return requireV2Runtime().history.read();
     },
 
-    getTrainPointsV2(): DataPoint[] {
-        requireV2Runtime();
-        return state.trainPoints;
-    },
-
-    getTestPointsV2(): DataPoint[] {
-        requireV2Runtime();
-        return state.testPoints;
+    getDatasetPointsV2(runId: number, datasetKey: string): WorkerDatasetPointsV2 {
+        const { runtime } = requireV2Runtime();
+        if (state.runId !== runId || runtime.dataset.datasetKey !== datasetKey) {
+            throw new Error('dataset points request does not match the active experiment');
+        }
+        return {
+            runId,
+            dataset: runtime.dataset,
+            trainPoints: state.trainPoints,
+            testPoints: state.testPoints,
+        };
     },
 
     getPredictionTraceV2(request: unknown): Promise<PredictionTraceResponseV2> {

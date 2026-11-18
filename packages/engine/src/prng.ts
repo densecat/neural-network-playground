@@ -18,6 +18,11 @@ export class PRNG {
         this.state = normalizeUint32Seed(seed);
     }
 
+    /** State to pass to a new PRNG to continue this exact stream. */
+    captureState(): number {
+        return this.state;
+    }
+
     /** Returns a float in [0, 1). */
     next(): number {
         this.state = (this.state + 0x6d2b79f5) >>> 0;

@@ -61,6 +61,9 @@ export interface PlaygroundStoreInitialization {
 export interface PlaygroundStore {
     access: ExperimentAccessState;
     preparation: PreparationState;
+    /** Changes when an explicit experiment replacement is published. */
+    runRequestId: number;
+    urlSyncNotice: string | null;
 
     featuresUI: FeaturesUI;
     demand: VisualizationDemand;
@@ -96,6 +99,8 @@ const DEFAULT_FEATURES_UI: FeaturesUI = {
     canvasNetworkGraph: true,
     webgpuGrid: true,
 };
+
+const VIEW_FIELDS = ['showTestData', 'discretizeOutput'] as const;
 
 const NO_ACTIVE_DOCUMENT: readonly ExperimentSchemaIssue[] = Object.freeze([{
     code: 'invalid-field',
@@ -177,6 +182,8 @@ export function createPlaygroundStore(
     const initialAccess = initialization.access;
 
     let nextRequestId = 0;
+    let viewRevision = 0;
+    const viewFieldRevisions = { showTestData: 0, discretizeOutput: 0 };
     let latestCandidateDocument: ValidatedExperimentDocumentV2 | null =
         initialAccess.status === 'ready' ? initialAccess.prepared.document : null;
     let lastSuccessfulPrepared = initialAccess.status === 'ready'
@@ -199,6 +206,7 @@ export function createPlaygroundStore(
                     issues: boundedIssues,
                 },
                 preparation: { status: 'error', requestId, issues: [] },
+                urlSyncNotice: null,
             });
         };
 
@@ -207,6 +215,7 @@ export function createPlaygroundStore(
             failureSource: ExperimentInputSource | null = null,
         ): Promise<SchemaResult<PreparedExperimentDocumentV2>> => {
             const requestId = ++nextRequestId;
+            const startingViewRevision = viewRevision;
             const candidateValidation = validateExperimentDocument(value);
             if (candidateValidation.ok) {
                 latestCandidateDocument = candidateValidation.value;
@@ -231,6 +240,7 @@ export function createPlaygroundStore(
                             issues: result.issues,
                         },
                         preparation: { status: 'error', requestId, issues: [] },
+                        urlSyncNotice: null,
                     });
                 } else {
                     latestCandidateDocument = lastSuccessfulPrepared?.document ?? null;
@@ -241,13 +251,24 @@ export function createPlaygroundStore(
                 return result;
             }
 
-            lastSuccessfulPrepared = result.value;
-            latestCandidateDocument = result.value.document;
+            let prepared = result.value;
+            if (startingViewRevision !== viewRevision && lastSuccessfulPrepared) {
+                const view = { ...prepared.document.view };
+                for (const field of VIEW_FIELDS) {
+                    if (viewFieldRevisions[field] > startingViewRevision) {
+                        view[field] = lastSuccessfulPrepared.document.view[field];
+                    }
+                }
+                prepared = { ...prepared, document: { ...prepared.document, view } };
+            }
+            lastSuccessfulPrepared = prepared;
+            latestCandidateDocument = prepared.document;
             set({
-                access: { status: 'ready', prepared: result.value },
+                access: { status: 'ready', prepared },
                 preparation: { status: 'ready', requestId, issues: [] },
+                runRequestId: requestId,
             });
-            return result;
+            return { ok: true, value: prepared };
         };
 
         const editRecipe = async (
@@ -265,9 +286,31 @@ export function createPlaygroundStore(
                 view: ValidatedExperimentDocumentV2['view'],
             ) => ExperimentDocumentV2['view'],
         ): Promise<SchemaResult<PreparedExperimentDocumentV2>> => {
-            const base = latestCandidateDocument;
-            if (!base) return unavailableResult(get().preparation.issues);
-            return replace({ ...base, view: edit(base.view) });
+            const { access } = get();
+            if (access.status !== 'ready') return unavailableResult(access.issues);
+            const current = access.prepared;
+            const validation = validateExperimentDocument({
+                ...current.document,
+                view: edit(current.document.view),
+            });
+            if (!validation.ok) return validation;
+            const { view } = validation.value;
+            const changedFields = VIEW_FIELDS.filter((field) => view[field] !== current.document.view[field]);
+            if (changedFields.length === 0) return { ok: true, value: current };
+            const prepared = { ...current, document: { ...current.document, view } };
+            viewRevision++;
+            lastSuccessfulPrepared = prepared;
+            const candidateView = { ...(latestCandidateDocument?.view ?? view) };
+            for (const field of changedFields) {
+                viewFieldRevisions[field] = viewRevision;
+                candidateView[field] = view[field];
+            }
+            if (latestCandidateDocument) {
+                latestCandidateDocument = { ...latestCandidateDocument, view: candidateView };
+            }
+            set({ access: { status: 'ready', prepared } });
+            get().syncToUrl();
+            return { ok: true, value: prepared };
         };
 
         const applyRecipe = async (
@@ -299,6 +342,8 @@ export function createPlaygroundStore(
             preparation: initialAccess.status === 'ready'
                 ? { status: 'ready', requestId: 0, issues: [] }
                 : { status: 'error', requestId: 0, issues: [] },
+            runRequestId: 0,
+            urlSyncNotice: null,
             featuresUI: { ...DEFAULT_FEATURES_UI },
             demand: { ...DEFAULT_DEMAND },
 
@@ -306,10 +351,11 @@ export function createPlaygroundStore(
             replaceImportedDocument: (value, file) => replace(value, { kind: 'file', file }),
             markIncompatible,
             startFresh: async () => {
+                const requestId = nextRequestId + 1;
                 const result = await replace(DEFAULT_EXPERIMENT_DOCUMENT);
                 if (result.ok) {
-                    const access = get().access;
-                    if (access.status !== 'ready' || access.prepared !== result.value) {
+                    const { access, runRequestId } = get();
+                    if (access.status !== 'ready' || runRequestId !== requestId) {
                         return {
                             ok: false,
                             issues: [{
@@ -319,8 +365,8 @@ export function createPlaygroundStore(
                             }],
                         };
                     }
-                    const hash = encodeExperimentUrl(result.value.document);
-                    window.history.replaceState(null, '', hash);
+                    get().syncToUrl();
+                    return { ok: true, value: access.prepared };
                 }
                 return result;
             },
@@ -330,10 +376,16 @@ export function createPlaygroundStore(
             syncToUrl: () => {
                 const access = get().access;
                 if (access.status !== 'ready') return unavailableResult(access.issues);
-                const prepared = access.prepared;
-                const hash = encodeExperimentUrl(prepared.document);
-                window.history.replaceState(null, '', hash);
-                return { ok: true, value: hash };
+                try {
+                    const hash = encodeExperimentUrl(access.prepared.document);
+                    window.history.replaceState(null, '', hash);
+                    if (get().urlSyncNotice !== null) set({ urlSyncNotice: null });
+                    return { ok: true, value: hash };
+                } catch {
+                    const message = 'The setup link could not be updated. Retry to update the link.';
+                    if (get().urlSyncNotice !== message) set({ urlSyncNotice: message });
+                    return { ok: false, issues: [{ code: 'invalid-field', path: '$', message }] };
+                }
             },
             loadFromUrl: async () => {
                 const raw = getRawExperimentHash(window.location.href);
