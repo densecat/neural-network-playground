@@ -182,7 +182,7 @@ test('paused scientific evidence, checkpoints, records and code preference survi
     await applyPreset(page, RECIPES.xor.title);
     await learning(page);
     await page.getByRole('combobox', { name: 'Steps per frame' }).selectOption('50');
-    await page.getByRole('button', { name: /^(Start|Resume) training$/ }).click();
+    await page.getByRole('button', { name: 'Play training', exact: true }).click();
     await expect.poll(async () => Number(await transport(page).getAttribute('data-model-step'))).toBeGreaterThanOrEqual(50);
     await page.getByRole('button', { name: 'Pause training', exact: true }).click();
     const paused = await converge(page);
