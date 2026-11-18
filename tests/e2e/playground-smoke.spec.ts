@@ -97,7 +97,7 @@ test('training can pause, single-step, preview and restore the initial checkpoin
     await load(page);
     await expect(transport(page).locator('xpath=ancestor-or-self::*[@aria-live or @role="status" or @role="alert"]')).toHaveCount(0);
     await page.getByRole('combobox', { name: 'Steps per frame' }).selectOption('1');
-    await page.getByRole('button', { name: 'Start training', exact: true }).click();
+    await page.getByRole('button', { name: 'Play training', exact: true }).click();
     await expect(transport(page)).toHaveAttribute('data-status', 'running');
     await expect.poll(async () => Number(await transport(page).getAttribute('data-model-step'))).toBeGreaterThan(0);
     await page.getByRole('button', { name: 'Pause training', exact: true }).click();
@@ -243,7 +243,7 @@ for (const width of [1440,1401,1280,950,901,800,390,320]) {
 test('reduced motion disables shell animation and transitions', async ({ page }) => {
     await page.emulateMedia({ reducedMotion:'reduce' });
     await load(page);
-    await page.getByRole('button', { name:'Start training' }).click();
+    await page.getByRole('button', { name:'Play training' }).click();
     await expect(transport(page)).toHaveAttribute('data-status','running');
     const motion = await page.locator('.atelier button, .atelier-tabs').evaluateAll(nodes => nodes.map(node => ({ animation:getComputedStyle(node).animationName, transition:getComputedStyle(node).transitionDuration })));
     expect(motion.every(value=>value.animation==='none' && value.transition.split(',').every(duration=>Number.parseFloat(duration)===0))).toBe(true);

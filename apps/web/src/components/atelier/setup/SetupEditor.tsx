@@ -1,9 +1,10 @@
-import { useId, useMemo } from 'react';
+import { useEffect, useId, useMemo, useRef } from 'react';
 import { ALL_FEATURES, ACTIVATION_LABELS, type DatasetId } from '@nn-playground/engine';
 import { PREPARED_PRESETS, MAX_NEURONS_PER_LAYER } from '@nn-playground/shared';
 import type { RecipeDraftController, SetupTab } from '../../../hooks/useRecipeDraft.ts';
 import { deriveDatasetPreviewModel } from '../../controls/datasetPreviewModel.ts';
 import { DatasetPreviewCanvas } from '../../controls/DatasetPreviewCanvas.tsx';
+import { RecipeChanges } from '../saved/RecipeChanges.tsx';
 import './setup.css';
 export type { SetupTab } from '../../../hooks/useRecipeDraft.ts';
 const DATASETS: [DatasetId, string][] = [
@@ -35,19 +36,31 @@ const LABELS: Record<string, string> = {
 };
 export function SetupEditor({ controller: c, tab, onTabChange }: { controller: RecipeDraftController; tab: SetupTab; onTabChange(tab: SetupTab): void; }) {
     const fieldPrefix = useId();
+    const variationHeading = useRef<HTMLHeadingElement>(null);
+    useEffect(() => { if (c.variationBaseline) variationHeading.current?.focus(); }, [c.variationBaseline]);
     const r = c.recipe;
     const previewSeed = r?.data.seed;
     const previewNoise = r?.data.noise;
+    const previewSampleCount = r?.data.sampleCount;
+    const previewDataset = tab === 'dataset' ? r?.task.dataset : undefined;
+    const canPreviewData = previewSeed !== undefined && Number.isInteger(previewSeed)
+        && previewSeed >= 0 && previewSeed <= 4_294_967_295
+        && previewNoise !== undefined && Number.isFinite(previewNoise)
+        && previewNoise >= 0 && previewNoise <= 100;
     const previews = useMemo(() => DATASETS.map(([datasetId, label]) => ({
         datasetId, label,
-        model: Number.isInteger(previewSeed) && previewSeed! >= 0 && previewSeed! <= 4294967295
-            && Number.isFinite(previewNoise) && previewNoise! >= 0 && previewNoise! <= 100
-            ? deriveDatasetPreviewModel({ datasetId, seed: previewSeed!, noise: previewNoise! }) : null,
-    })), [previewSeed, previewNoise]);
+        model: canPreviewData ? deriveDatasetPreviewModel({ datasetId, seed: previewSeed, noise: previewNoise }) : null,
+    })), [canPreviewData, previewSeed, previewNoise]);
     const selectedPreview = useMemo(() => {
-        if (!r || !Number.isInteger(r.data.seed) || r.data.seed < 0 || r.data.seed > 4294967295 || !Number.isFinite(r.data.noise) || r.data.noise < 0 || r.data.noise > 100 || !Number.isInteger(r.data.sampleCount) || r.data.sampleCount < 2 || r.data.sampleCount > 1000) return null;
-        return deriveDatasetPreviewModel({ datasetId: r.task.dataset, seed: r.data.seed, noise: r.data.noise, sampleCount: r.data.sampleCount });
-    }, [r]);
+        if (!canPreviewData || previewDataset === undefined || previewSampleCount === undefined
+            || !Number.isInteger(previewSampleCount) || previewSampleCount < 2 || previewSampleCount > 1_000) return null;
+        return deriveDatasetPreviewModel({
+            datasetId: previewDataset,
+            seed: previewSeed,
+            noise: previewNoise,
+            sampleCount: previewSampleCount,
+        });
+    }, [canPreviewData, previewDataset, previewSeed, previewNoise, previewSampleCount]);
     if (!r) return <p role="alert">No validated experiment is available for setup.</p>;
     const fieldErrors = (path: string) => c.issues
         .filter((issue) => issue.startsWith(`recipe.${path.replace(/\.(\d+)/g, '[$1]')}:`))
@@ -83,6 +96,11 @@ export function SetupEditor({ controller: c, tab, onTabChange }: { controller: R
             </button>)}
         </nav>
         <fieldset disabled={c.busy} className="atelier-setup-fields">
+            {c.variationBaseline && <section className="atelier-section">
+                <h2 ref={variationHeading} tabIndex={-1} className="atelier-variation-heading">Variation of {c.variationBaseline.title ?? c.variationBaseline.id}</h2>
+                <p>Change one setting to see its effect. Apply changes to start a fresh model, then save the run to compare it with the baseline.</p>
+                {c.valid && <RecipeChanges baseline={c.variationBaseline.recipe} variation={r} />}
+            </section>}
             <details className="atelier-recipe-presets">
                 <summary>Start from a preset</summary>
                 <p>A preset replaces the whole draft. Review or adjust it, then apply all changes together.</p>
@@ -261,7 +279,7 @@ export function SetupEditor({ controller: c, tab, onTabChange }: { controller: R
                 {c.submitted ? 'Waiting for the new experiment to be ready…' : 'Applying setup restarts training. Changes across all three sections apply together.'}
             </p>
             <button type="button" disabled={c.busy || !c.dirty} onClick={c.commands.cancel}>Cancel</button>
-            <button type="button" className="atelier-action" disabled={!c.dirty || !c.valid || c.busy} onClick={() => void c.commands.apply()}>Apply changes</button>
+            <button type="button" className="atelier-action" disabled={!c.canApply} onClick={() => void c.commands.apply()}>Apply changes</button>
         </footer>
     </section>;
 }

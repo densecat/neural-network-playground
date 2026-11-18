@@ -62,8 +62,8 @@ export default defineConfig(({ mode }) => ({
         sourcemap: mode === 'development',
         rollupOptions: {
             output: {
-                // Keep all initial capabilities in the capped entry. Merge tiny
-                // shared helpers to avoid separate gzip overhead; feature lazies stay split.
+                // Merge small shared helpers to avoid separate gzip overhead.
+                // Larger worker/page modules and lazy feature views can stay separate.
                 experimentalMinChunkSize: 10000,
                 chunkFileNames: 'assets/[name]-[hash].js',
                 entryFileNames: 'assets/[name]-[hash].js',

@@ -7,6 +7,7 @@ interface ErrorBoundaryProps {
     description: string;
     actionLabel?: string;
     onRetry?: () => void | Promise<void>;
+    canRetry?: (error: Error) => boolean;
     className?: string;
 }
 
@@ -92,7 +93,7 @@ export class ErrorBoundary extends React.Component<ErrorBoundaryProps, ErrorBoun
                                 this.state.error.message,
                                 this.state.retryError,
                             ].filter(Boolean).join(' ')}
-                            action={{
+                            action={this.props.canRetry?.(this.state.error) === false ? undefined : {
                                 label: this.state.retrying ? 'Retrying…' : this.props.actionLabel ?? 'Try again',
                                 onClick: this.handleRetry,
                             }}

@@ -13,7 +13,7 @@ Build, train, and inspect neural networks in a spacious data → network → pre
 - **Network workspace** — Square neuron activation maps, signed connection filters, local pan/zoom, and a focused neuron inspector.
 - **Live training and Results** — Play/Pause, Step, Reset, speed, session checkpoints, prediction overlays, learning histories, and task-aware confusion metrics.
 - **Trace, Activations, and Gradients** — Inspect real samples, activation distributions, backpropagation, and diagnostic parameter probes with provenance.
-- **Local saved runs** — Save, rename, download, apply recipes, and compare two records with compatible-evidence checks and exact-artifact save recovery.
+- **Local saved runs** — Save evaluated runs, download evidence as JSON or evaluation history as CSV, and compare compatible results. Choose **Try a variation** on a saved run to edit a copy in Setup and compare the next saved result with its baseline.
 - **Ten guided lessons** — Learn from single neurons through XOR, softmax, regression, regularization, and noisy data.
 - **Exports and sharing** — Pseudocode, NumPy, TensorFlow.js, configuration JSON, and shareable V2 setup links. Imported JSON is previewed before explicit Apply.
 - **System, Light, and Dark** — Follow the device or remember a chosen theme; plots repaint without changing training.
@@ -65,7 +65,14 @@ New visitors start at Playground → Network with the default experiment paused.
 Use Setup to stage a complete recipe, Results to inspect learning and prediction,
 and Inspect for paused diagnostics. Saved runs and Lessons are separate header
 destinations. The utility menu contains exports/imports, checkpoints, guidance,
-and help. Switching views or themes never resets or pauses training.
+and help. Switching views or themes preserves the active training run.
+
+To compare training durations from the same model, pause training, open
+**Checkpoints**, choose a checkpoint and enter an optimizer-step budget.
+**Branch from checkpoint** keeps the previous live model in the timeline. Press
+**Play** to train up to the selected limit. New checkpoints restore the shuffle
+state as well as the parameters and optimizer. The evaluation history and
+automatic-stop tracking start fresh on each branch.
 
 Guidance More, Standard, and Compact preserve the former Beginner, Explore, and
 Lab explanation densities. They do not hide tools. Navigation and theme are local

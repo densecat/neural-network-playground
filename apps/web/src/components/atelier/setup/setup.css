@@ -17,8 +17,7 @@
 .atelier-draft-inputs {display:grid;gap:8px;min-width:90px}.atelier-draft-inputs span {padding:12px;border:1px solid var(--border-color);text-align:center;font-family:var(--font-mono)}
 .atelier-network-draft>div{min-width:110px}.atelier-network-draft>button{min-width:150px}
 
-.atelier-setup {display:flex;flex-direction:column;height:max(360px,calc(var(--atelier-viewport-height,100dvh) - 394px));min-width:0}.atelier-setup-tabs{flex-shrink:0}.atelier-setup-fields{overflow:auto;flex:1;min-height:0;padding:0 8px 20px 0;scroll-padding:16px}.atelier-setup-errors{max-height:120px;overflow:auto;flex-shrink:0}
-
-@container atelier (max-width:759px){.atelier-setup{height:max(360px,calc(var(--atelier-viewport-height,100dvh) - 332px))}}
+.atelier-setup {min-width:0}
+.atelier-setup-fields {padding-bottom:20px}
 
 .atelier-neuron-stepper{display:flex;align-items:end;gap:4px;margin-bottom:8px}.atelier-neuron-stepper .atelier-field{flex:1;min-width:0}.atelier-neuron-stepper button{flex-shrink:0}.atelier-neuron-stepper input{text-align:center}

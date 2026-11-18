@@ -16,6 +16,8 @@ import {
 const inspectionFailure = vi.hoisted(() => ({ active: false }));
 const useTrainingMount = vi.hoisted(() => vi.fn());
 const useExperimentMemoryStorageSync = vi.hoisted(() => vi.fn());
+const shellCommit = vi.hoisted(() => vi.fn());
+const graphCommit = vi.hoisted(() => vi.fn());
 
 const trainingMock = {
     play: vi.fn(),
@@ -90,19 +92,31 @@ function fullEvaluation(revision: number, step: number, epoch: number) {
     };
 }
 
-vi.mock('./hooks/useTraining.ts', () => ({
-    useTraining: () => {
-        useTrainingMount();
-        return trainingMock;
-    },
-}));
+vi.mock('./hooks/useTraining.ts', async () => {
+    const { useLayoutEffect } = await import('react');
+    return {
+        useTraining: () => {
+            useTrainingMount();
+            useLayoutEffect(() => { shellCommit(); });
+            return trainingMock;
+        },
+    };
+});
 
 vi.mock('./hooks/useExperimentMemoryStorageSync.ts', () => ({
     useExperimentMemoryStorageSync,
 }));
 
 vi.mock('./components/visualization/DecisionBoundaryCanvas.tsx', () => ({ DecisionBoundaryCanvas: () => <canvas data-decision-boundary-canvas aria-label="Boundary paint" /> }));
-vi.mock('./components/visualization/NetworkGraph.tsx', () => ({ NetworkGraph: () => <div>Graph</div> }));
+vi.mock('./components/visualization/NetworkGraph.tsx', async () => {
+    const { useLayoutEffect } = await import('react');
+    return {
+        NetworkGraph: function MockGraph() {
+            useLayoutEffect(() => { graphCommit(); });
+            return <div>Graph</div>;
+        },
+    };
+});
 vi.mock('./components/controls/DatasetPreviewCanvas.tsx', () => ({ DatasetPreviewCanvas: () => <canvas aria-hidden="true" /> }));
 vi.mock('./components/controls/ConfigPanel.tsx',       () => ({ ConfigPanel: () => <div>Config</div> }));
 vi.mock('./components/controls/InspectionPanel.tsx',   () => ({ InspectionPanel: () => { if (inspectionFailure.active) throw new Error('Inspection failed'); return <div>Inspection</div>; } }));
@@ -127,14 +141,20 @@ describe('App accessibility shell', () => {
         usePlaygroundStore.setState({
             access: { status: 'ready', prepared: prepared.value },
             preparation: { status: 'ready', requestId: 0, issues: [] },
+            urlSyncNotice: null,
         });
 
         useTrainingStore.setState({
             status: 'idle',
+            datasetStatus: 'ready',
+            datasetError: null,
+            latestLiveSignal: null,
+            latestEvaluation: null,
             pauseReason: null,
             dataConfigLoading: false,
             networkConfigLoading: false,
             pendingConfigSource: null,
+            runtimeSyncPending: false,
             configError: null,
             configErrorSource: null,
             workerError: null,
@@ -166,6 +186,7 @@ describe('App accessibility shell', () => {
     it('recovers a healthy workspace through navigation after a view fails', async () => {
         inspectionFailure.active = true;
         useLayoutStore.setState({ workspaceTab: 'inspect' });
+        useTrainingStore.setState({ status: 'running', latestLiveSignal: liveSignal(20, 20, 1) });
         const error = vi.spyOn(console, 'error').mockImplementation(() => {});
         try {
             render(<App />);
@@ -173,8 +194,107 @@ describe('App accessibility shell', () => {
             fireEvent.click(screen.getByRole('tab', { name: 'Setup' }));
             expect(screen.getByRole('region', { name: 'Experiment setup' })).toBeInTheDocument();
             expect(screen.queryByText('Workspace unavailable')).not.toBeInTheDocument();
+            expect(screen.getByRole('region', { name: 'Training controls' })).toHaveAttribute('data-model-step', '20');
+            expect(screen.getByRole('button', { name: 'Pause training' })).toBeEnabled();
             expect(trainingMock.reset).not.toHaveBeenCalled();
         } finally { error.mockRestore(); }
+    });
+
+    it('commits worker frames only to mounted evidence and transport', async () => {
+        useTrainingStore.setState({ status: 'running' });
+        render(<App />);
+        const stream = (after: number) => {
+            for (let frame = after + 1; frame <= after + 6; frame++) {
+                act(() => useTrainingStore.setState({
+                    outputGridVersion: frame,
+                    neuronGridsVersion: frame,
+                    paramsVersion: frame,
+                    latestLiveSignal: liveSignal(frame, frame, 1),
+                }));
+            }
+        };
+
+        shellCommit.mockClear();
+        graphCommit.mockClear();
+        stream(10);
+        expect(graphCommit).toHaveBeenCalledTimes(6);
+        expect(shellCommit).not.toHaveBeenCalled();
+
+        fireEvent.click(screen.getByRole('button', { name: 'Saved runs' }));
+        await screen.findByText('RunHistory');
+        shellCommit.mockClear();
+        graphCommit.mockClear();
+        stream(16);
+        expect(graphCommit).not.toHaveBeenCalled();
+        expect(shellCommit).not.toHaveBeenCalled();
+        expect(screen.getByRole('region', { name: 'Training controls' })).toHaveAttribute('data-model-step', '22');
+    });
+
+    it('keeps both plots and controls in a loading state through initial dataset hydration', () => {
+        useTrainingStore.setState({ datasetStatus: 'loading', trainPoints: [], testPoints: [], evidenceGenerationId: null });
+        const { container } = render(<App />);
+        const play = screen.getByRole('button', { name: 'Play training' });
+        expect(play).toHaveTextContent('Play');
+        expect(play).toBeDisabled();
+        expect(screen.getByText('Preparing the model and dataset…')).toBeInTheDocument();
+        expect(screen.getAllByText('Loading dataset…')).toHaveLength(2);
+        expect(screen.queryByText('No training data')).not.toBeInTheDocument();
+        expect(container.querySelector('.atelier-data-plot.atelier-plot-state')).toBeInTheDocument();
+        expect(container.querySelector('.decision-boundary.atelier-plot-state')).toBeInTheDocument();
+        expect(dispatchGlobalKeyDown('Space').defaultPrevented).toBe(false);
+        expect(trainingMock.play).not.toHaveBeenCalled();
+
+        act(() => useTrainingStore.setState({ evidenceGenerationId: 1 }));
+        expect(play).toBeDisabled();
+        act(() => useTrainingStore.getState().hydrateDataset(1, [{ x: 0, y: 0, label: 1 }], [{ x: 0.5, y: 0.5, label: 0 }]));
+        expect(play).toBeEnabled();
+        expect(screen.getByText('Ready · choose Play to begin')).toBeInTheDocument();
+        expect(screen.getByRole('img', { name: /1 training samples/ })).toBeInTheDocument();
+        expect(screen.getByLabelText('Boundary paint')).toBeInTheDocument();
+    });
+
+    it('shows startup failures as unavailable with worker recovery', () => {
+        useTrainingStore.setState({ datasetStatus: 'loading', evidenceGenerationId: null });
+        const { container } = render(<App />);
+        act(() => useTrainingStore.getState().setWorkerError('Startup failed'));
+        expect(screen.getByRole('alertdialog', { name: 'Worker connection lost' })).toBeVisible();
+        expect(container.querySelector('.atelier-transport-status')).toHaveTextContent('Training unavailable');
+        expect(screen.queryByText('Loading dataset…')).not.toBeInTheDocument();
+        expect(screen.getAllByText('The dataset could not be loaded.')).toHaveLength(2);
+    });
+
+    it('blocks transport and shortcuts until a runtime update completes', () => {
+        render(<App />);
+        const play = screen.getByRole('button', { name: 'Play training' });
+        act(() => useTrainingStore.setState({ runtimeSyncPending: true }));
+        expect(play).toBeDisabled();
+        expect(screen.getByText('Updating the model…')).toBeInTheDocument();
+        expect(screen.getAllByText('Loading dataset…')).toHaveLength(2);
+        expect(dispatchGlobalKeyDown('Space').defaultPrevented).toBe(false);
+        expect(trainingMock.play).not.toHaveBeenCalled();
+        act(() => useTrainingStore.setState({ runtimeSyncPending: false }));
+        expect(play).toBeEnabled();
+    });
+
+    it('offers nonfatal address retry beside Share setup', () => {
+        const originalSync = usePlaygroundStore.getState().syncToUrl;
+        const message = 'The experiment changed, but its address could not be updated.';
+        const syncToUrl = vi.fn(() => {
+            usePlaygroundStore.setState({ urlSyncNotice: null });
+            return { ok: true as const, value: '#experiment' };
+        });
+        usePlaygroundStore.setState({ urlSyncNotice: message, syncToUrl });
+        try {
+            render(<App />);
+            expect(screen.getByText(message)).toHaveAttribute('role', 'status');
+            expect(screen.getByRole('button', { name: 'Share setup' })).toBeEnabled();
+            expect(screen.getByRole('button', { name: 'Play training' })).toBeEnabled();
+            fireEvent.click(screen.getByRole('button', { name: 'Retry address update' }));
+            expect(syncToUrl).toHaveBeenCalledTimes(1);
+            expect(screen.queryByText(message)).not.toBeInTheDocument();
+        } finally {
+            usePlaygroundStore.setState({ syncToUrl: originalSync });
+        }
     });
 
     it('loads a valid experiment hash changed after mount through the URL loader', async () => {

@@ -52,11 +52,13 @@ describe('local layout preferences', () => {
         expect(store.getState().workspaceTab).toBe('inspect'); store.getState().clearExportRequest(); expect(store.getState().exportRequest).toBeNull();
     });
     const legacyCases: Array<[Record<string, unknown>, Record<string, unknown>]> = [
+        [{view:'build',activeRecipeSection:'presets'}, {workspaceTab:'setup',setupTab:'dataset'}],
         [{view:'build',activeRecipeSection:'features'}, {workspaceTab:'setup',setupTab:'network'}],
         [{phase:'run',activeTabLeft:'network',activeTabRight:'confusion',layout:'split',codeExportTab:'tfjs'}, {workspaceTab:'results',setupTab:'network',resultsTab:'errors',codeExportTab:'tfjs'}],
         [{view:'run',activeEvidenceView:'inspection',audienceMode:'beginner',advancedToolsOpen:false}, {workspaceTab:'inspect',audienceMode:'beginner'}],
         [{view:'build',activeRecipeSection:'hyperparams',audienceMode:'lab',advancedToolsOpen:false,buildContextOpen:true}, {workspaceTab:'setup',setupTab:'training',audienceMode:'lab'}],
         [{view:'run',activeEvidenceView:'history'}, {destination:'saved-runs'}],
+        [{view:'run',activeEvidenceView:'boundary'}, {workspaceTab:'results',resultsTab:'boundary'}],
         [{view:'run',activeEvidenceView:'loss'}, {workspaceTab:'results',resultsTab:'learning'}],
         [{view:'run',activeRecipeSection:'features',activeEvidenceView:'code',codeExportTab:'numpy'}, {workspaceTab:'results',setupTab:'network',codeExportTab:'numpy',exportRequest:{mode:'code',id:1}}],
         [{view:'build',activeRecipeSection:'config'}, {workspaceTab:'setup',exportRequest:{mode:'setup',id:1}}],
