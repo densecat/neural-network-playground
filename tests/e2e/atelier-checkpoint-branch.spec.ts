@@ -26,6 +26,8 @@ test('a bounded checkpoint branch preserves the previous live model for restore'
     await expect(training.getByRole('status')).toContainText('Branch finished');
 
     await utility(page, 'Session checkpoints');
+    await timeline.press('Home');
+    await expect(timeline).toHaveAttribute('aria-valuetext', 'Step 0');
     await dialog.getByRole('button', { name: 'Select previous live checkpoint', exact: true }).click();
     await expect(timeline).toHaveAttribute('aria-valuetext', 'Step 1');
     await dialog.getByRole('button', { name: 'Restore Step 1', exact: true }).click();
