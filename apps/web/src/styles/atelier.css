@@ -85,6 +85,10 @@ button:disabled {cursor:not-allowed;opacity:.48}
 .atelier-class-legend i {width:7px;height:7px;border-radius:50%;background:var(--class-color)}
 .atelier-network-graph {height:560px;min-width:0}
 .atelier-network .network-graph-container {height:100%;min-height:0}
+.network-graph-container {display:grid;grid-template-rows:auto minmax(0,1fr);min-width:0}
+.network-graph-layer-labels {position:relative;overflow:clip;height:28px;line-height:28px;color:var(--text-secondary);font-size:12px;font-weight:600}
+.network-graph-layer-labels>span {position:absolute;translate:-50% 0;white-space:nowrap}
+.network-graph-plot {position:relative;min-width:0;min-height:0;overflow:clip}
 .atelier-network .network-graph-summary {position:static;max-height:88px;overflow:auto;padding:8px 0;font-size:14px}
 .atelier-neuron-detail {border-top:1px solid var(--border-color);margin-top:24px;padding-top:24px}
 .atelier-neuron-detail .precision-selection-details {display:grid;grid-template-columns:220px 1fr 1fr;gap:20px}
@@ -192,7 +196,7 @@ button:disabled {cursor:not-allowed;opacity:.48}
 .atelier[data-short-viewport] .atelier-transport,.atelier[data-short-viewport] .atelier-header {position:static}
 .atelier[data-short-viewport] .atelier-workspace>.atelier-tabs {top:0}
 
-.atelier-artifact-step {display:block;min-height:1.6em;font-variant-numeric:tabular-nums}
+.atelier-artifact-step {display:block;min-height:1lh;font-variant-numeric:tabular-nums;white-space:nowrap}
 .atelier-transport-position>div {display:flex;align-items:center;gap:4px}
 .atelier-transport-position strong {display:inline-block;min-width:6ch;font-variant-numeric:tabular-nums}
 @container atelier (max-width:759px) {
@@ -228,5 +232,5 @@ button:disabled {cursor:not-allowed;opacity:.48}
 
 @media (forced-colors: active) {
   .decision-boundary__swatch, .atelier-class-legend i, .atelier-data-plot circle, .network-graph-legend__swatch {forced-color-adjust:none}
-  .network-graph-container > canvas, .network-graph-container > svg {forced-color-adjust:none;background:var(--bg-primary);color:var(--text-secondary)}
+  .network-graph-plot > canvas, .network-graph-plot > svg {forced-color-adjust:none;background:var(--bg-primary);color:var(--text-secondary)}
 }

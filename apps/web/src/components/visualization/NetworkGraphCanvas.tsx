@@ -1,7 +1,6 @@
 // ── Canvas Network Graph (AS-5) ──────────────────────────────────────────────
-// Replaces the SVG topology view with a single <canvas> for edges, node
-// rings, and labels — plus DOM overlays for the per-neuron mini heatmaps,
-// the hover tooltip, and a screen-reader-only structural summary.
+// Canvas and SVG share the plot layout, layer labels and DOM overlays for
+// per-neuron mini heatmaps, the tooltip and the accessible structure.
 //
 // Selection is shared with NetworkGraphSVG through an optional external controller;
 // reads everything from the same stores. Toggle is owned by the parent
@@ -10,8 +9,8 @@
 // Why a single canvas? The SVG renderer commits ~650 DOM nodes per frame
 // for a 16+16 hidden-layer network and re-runs style recalc on every hover
 // className flip. The canvas renderer does one clearRect, ~6 stroke()
-// calls (edge buckets), a handful of fill()s, and N fillText for layer
-// labels — typically <0.5ms regardless of network size.
+// calls (edge buckets) and a handful of fill()s — typically <0.5ms
+// regardless of network size.
 //
 // Heatmaps stay in the React tree as <HeatmapCanvas> children positioned
 // absolutely over the main canvas. Painting heatmaps inside the main
@@ -51,7 +50,6 @@ import {
     hitTestNode,
     nodeRefKey,
     paintEdges,
-    paintLabels,
     paintNodes,
     shouldRenderEdge,
 } from './networkGraphPainter.ts';
@@ -395,7 +393,7 @@ export function NetworkGraphCanvasView({ controller, renderer = 'canvas' }: { re
     }, []);
 
     const geometry = useMemo(() => deriveNodeGeometry(containerSize.height, maxNodes), [containerSize.height, maxNodes]);
-    const { canvasWidth, canvasHeight, layerGap, nodeGap } = useMemo(() => {
+    const { canvasWidth, canvasHeight, layerPositions, nodeGap } = useMemo(() => {
         const w = Math.max(320, containerSize.width);
         const h = Math.max(200, containerSize.height);
         const usableW = Math.max(0, w - PAD_X * 2);
@@ -408,23 +406,23 @@ export function NetworkGraphCanvasView({ controller, renderer = 'canvas' }: { re
             : MIN_NODE_GAP;
         const canvasWidth = Math.max(w, (layers.length - 1) * layerGap + PAD_X * 2);
         const canvasHeight = Math.max(h, (maxNodes - 1) * nodeGap + PAD_Y * 2);
-        return { canvasWidth, canvasHeight, layerGap, nodeGap };
+        const startX = (canvasWidth - (layers.length - 1) * layerGap) / 2;
+        const layerPositions = layers.map((_, layerIdx) => startX + layerIdx * layerGap);
+        return { canvasWidth, canvasHeight, layerPositions, nodeGap };
     }, [containerSize, layers, maxNodes, geometry.height]);
     const canvasSizeRef = useRef({ width: canvasWidth, height: canvasHeight });
     canvasSizeRef.current = { width: canvasWidth, height: canvasHeight };
 
     const nodePositions: NodePos[][] = useMemo(() => {
-        const startX = (canvasWidth - (layers.length - 1) * layerGap) / 2;
         return layers.map((count, layerIdx) => {
-            const x = startX + layerIdx * layerGap;
             const totalHeight = (count - 1) * nodeGap;
             const startY = canvasHeight / 2 - totalHeight / 2;
             return Array.from({ length: count }, (_, nodeIdx) => ({
-                x,
+                x: layerPositions[layerIdx],
                 y: startY + nodeIdx * nodeGap,
             }));
         });
-    }, [layers, canvasWidth, canvasHeight, layerGap, nodeGap]);
+    }, [layers, canvasHeight, layerPositions, nodeGap]);
 
     const layerLabels = useMemo(() => {
         return layers.map((_, idx) => {
@@ -607,8 +605,6 @@ export function NetworkGraphCanvasView({ controller, renderer = 'canvas' }: { re
 
     // ── Paint pass ───────────────────────────────────────────────────────────
     // Triggers on parameter/grid versions (accepted artifacts), layout changes, or hover state.
-    // `paintLabels` is a bit redundant on every hover but cheap (~5 fillText
-    // calls) and saves us a separate effect.
     useEffect(() => {
         const canvas = canvasRef.current;
         if (!canvas) return;
@@ -642,7 +638,6 @@ export function NetworkGraphCanvasView({ controller, renderer = 'canvas' }: { re
             nodeActivationByKey,
         });
         paintNodes(ctx, nodePositions, flat, { nodeHealthByKey, geometry, selectedNode: controller.selectedNode, palette });
-        paintLabels(ctx, nodePositions, layerLabels, palette);
         ctx.restore();
     }, [
         palette,
@@ -657,7 +652,6 @@ export function NetworkGraphCanvasView({ controller, renderer = 'canvas' }: { re
         viewMode,
         nodeHealthByKey,
         nodeActivationByKey,
-        layerLabels,
         viewport,
         // re-paint on every snapshot even if `flat` reference is stable —
         // weights mutate in place inside the Float32Array.
@@ -849,18 +843,10 @@ export function NetworkGraphCanvasView({ controller, renderer = 'canvas' }: { re
             `, ${outputLabel}. Hidden activation: ${activation}. Output activation: ${outputActivation}.`;
     }, [activeFeatures.length, hiddenLayers, activation, outputActivation, outputLayerSize]);
 
-    return (
-        <NetworkGraphFrame
-            story={architectureStory} capacity={capacityLabel}
-            datasetHint={datasetTopologyHint} healthHint={layerStatsHint}
-            lesson={networkLessonStep?.body}
-            zoom={viewport.zoom} onZoomOut={() => zoomGraph(-1)} onZoomIn={() => zoomGraph(1)} onFit={fitGraphToView}
-            viewMode={viewMode} onViewMode={setViewMode} edgeFilter={edgeFilter} onEdgeFilter={setEdgeFilter}
-        >
+    const plot = (
         <div
             ref={containerRef}
-            className="network-graph-container"
-            style={{ position: 'relative', width: '100%', height: '100%', minWidth: 0, overflow: 'hidden' }}
+            className="network-graph-plot"
             onKeyDown={(event) => {
                 if (event.key === 'Escape' && controller.selectedNode) {
                     event.preventDefault(); event.stopPropagation(); controller.commands.clearSelection();
@@ -917,7 +903,6 @@ export function NetworkGraphCanvasView({ controller, renderer = 'canvas' }: { re
                             width={geometry.width + 8} height={geometry.height + 8} rx={geometry.cornerRadius + 4} fill="none"
                             stroke={health === 'low' ? 'rgba(239, 68, 68, .78)' : 'rgba(234, 179, 8, .82)'} strokeWidth={2} strokeDasharray={health === 'low' ? '3 3' : '1 3'} /> : null;
                     }))}
-                    {nodePositions.map((layer, l) => <text key={l} x={layer[0]?.x ?? 0} y={20} textAnchor="middle" fill={palette.muted} fontSize={10}>{layerLabels[l]}</text>)}
                 </g>
             </svg>}
 
@@ -1031,6 +1016,26 @@ export function NetworkGraphCanvasView({ controller, renderer = 'canvas' }: { re
                 {accessibilitySummary}
             </p>
         </div>
+    );
+
+    return (
+        <NetworkGraphFrame
+            story={architectureStory} capacity={capacityLabel}
+            datasetHint={datasetTopologyHint} healthHint={layerStatsHint}
+            lesson={networkLessonStep?.body}
+            zoom={viewport.zoom} onZoomOut={() => zoomGraph(-1)} onZoomIn={() => zoomGraph(1)} onFit={fitGraphToView}
+            viewMode={viewMode} onViewMode={setViewMode} edgeFilter={edgeFilter} onEdgeFilter={setEdgeFilter}
+        >
+            <div className="network-graph-container">
+                <div className="network-graph-layer-labels" aria-hidden="true">
+                    {layerLabels.map((label, layerIdx) => (
+                        <span key={label} style={{ left: layerPositions[layerIdx] * viewport.zoom + viewport.panX }}>
+                            {label}
+                        </span>
+                    ))}
+                </div>
+                {plot}
+            </div>
         </NetworkGraphFrame>
     );
 }

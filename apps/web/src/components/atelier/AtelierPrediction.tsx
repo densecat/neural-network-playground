@@ -17,12 +17,13 @@ export function DatasetPlotStatus({ className, status }: { className: string; st
 
 export function AtelierPrediction({ boundary, details }: { boundary: DecisionBoundaryController; details: boolean }) {
     const { model } = boundary;
+    const gridStep = model.kind !== 'empty' && model.kind !== 'unavailable' ? model.provenance?.model.step : undefined;
     return <>
         <DecisionBoundaryCanvas model={model} />
         {details
             ? <BoundaryEvidencePanel controller={boundary} />
             : <p className="atelier-plot-caption">
-                {model.kind !== 'empty' && model.kind !== 'unavailable' && model.provenance && <span className="atelier-artifact-step">Grid at step {model.provenance.model.step}.</span>}
+                <span className="atelier-artifact-step">{gridStep === undefined ? null : `Grid at step ${gridStep}.`}</span>
                 The model’s output across the input space. Select Results for evaluation and overlays.
             </p>}
     </>;
