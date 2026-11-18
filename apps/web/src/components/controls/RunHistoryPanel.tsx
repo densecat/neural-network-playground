@@ -11,6 +11,7 @@ import { reconcileComparisonSelection } from './runComparisonSelection.ts';
 import { SavedRunComparison } from '../atelier/saved/Comparison.tsx';
 import { ConfirmAction } from '../atelier/saved/ConfirmAction.tsx';
 import { RenameRun } from '../atelier/saved/RenameRun.tsx';
+import { savedEvaluationCsv } from '../atelier/saved/evaluationCsv.ts';
 import '../atelier/saved/saved.css';
 import { STATE_EFFECTS } from '../../copy/stateEffects.ts';
 
@@ -33,10 +34,10 @@ function formatMetric(value: number): string {
     return Number.isFinite(value) ? value.toFixed(4) : 'n/a';
 }
 
-function downloadText(filename: string, text: string, onError: (message: string) => void): void {
+function downloadText(filename: string, text: string, onError: (message: string) => void, mimeType = 'application/json'): void {
     let url: string | null = null;
     try {
-        url = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+        url = URL.createObjectURL(new Blob([text], { type: mimeType }));
         const anchor = document.createElement('a');
         anchor.href = url;
         anchor.download = filename;
@@ -73,18 +74,23 @@ function RejectedRecord({ record }: { record: RejectedExperimentRunRecordV2 }) {
     );
 }
 
-interface Props { saveController?: SaveCurrentRunController }
+interface Props {
+    saveController?: SaveCurrentRunController;
+    saveFocusRequest?: number;
+    onTryVariation?: (record: ExperimentRunRecordV2) => void;
+    variationDisabled?: boolean;
+}
 
 // The standalone adapter is for direct-render/legacy consumers. Production
 // receives the single controller owned above the drawer in App.
-export const RunHistoryPanel = memo(function RunHistoryPanel({ saveController }: Props) {
-    return saveController ? <RunHistoryContent saveController={saveController} /> : <StandaloneRunHistory />;
+export const RunHistoryPanel = memo(function RunHistoryPanel({ saveController, ...props }: Props) {
+    return saveController ? <RunHistoryContent saveController={saveController} {...props} /> : <StandaloneRunHistory {...props} />;
 });
-function StandaloneRunHistory() {
+function StandaloneRunHistory(props: Omit<Props, 'saveController'>) {
     const saveController = useSaveCurrentRun();
-    return <RunHistoryContent saveController={saveController} />;
+    return <RunHistoryContent saveController={saveController} {...props} />;
 }
-function RunHistoryContent({ saveController }: { saveController: SaveCurrentRunController }) {
+function RunHistoryContent({ saveController, saveFocusRequest, onTryVariation, variationDisabled }: Props & { saveController: SaveCurrentRunController }) {
     const hydrationStatus = useExperimentMemoryStore((state) => state.hydrationStatus);
     const records = useExperimentMemoryStore((state) => state.records);
     const rejectedRecords = useExperimentMemoryStore((state) => state.rejectedRecords);
@@ -103,10 +109,14 @@ function RunHistoryContent({ saveController }: { saveController: SaveCurrentRunC
     const replaceDocument = usePlaygroundStore((state) => state.replaceDocument);
     const saving = saveController.busy;
     const [actionError, setActionError] = useState<string | null>(null);
+    const runNameRef = useRef<HTMLInputElement>(null);
+    const lastSaveFocus = useRef(0);
     const compareButtonRef = useRef<HTMLButtonElement>(null);
+    const comparisonTrigger = useRef<HTMLButtonElement | null>(null);
     const listRef = useRef<HTMLDivElement>(null);
     const listScroll = useRef<Array<{ node: HTMLElement; top: number; left: number }>>([]);
     const [comparing, setComparing] = useState(false);
+    const [showRecipeChanges, setShowRecipeChanges] = useState(false);
     const [runTitle, setRunTitle] = useState('');
     const [comparisonSelection, setComparisonSelection] = useState<readonly string[] | null>(null);
     const panelId = useId();
@@ -129,6 +139,9 @@ function RunHistoryContent({ saveController }: { saveController: SaveCurrentRunC
         const record = records.find((candidate) => candidate.id === id);
         return record ? [record] : [];
     });
+    const comparisonOffer = saveController.comparisonOffer;
+    const offeredBaseline = records.find((record) => record.id === comparisonOffer?.baselineId);
+    const offeredVariation = records.find((record) => record.id === comparisonOffer?.variationId);
 
     useEffect(() => {
         mountedRef.current = true;
@@ -152,17 +165,33 @@ function RunHistoryContent({ saveController }: { saveController: SaveCurrentRunC
 
     useLayoutEffect(() => {
         if (comparing) return;
-        if (listScroll.current.length) compareButtonRef.current?.focus({ preventScroll: true });
+        if (listScroll.current.length) {
+            const trigger = comparisonTrigger.current?.isConnected ? comparisonTrigger.current : compareButtonRef.current;
+            trigger?.focus({ preventScroll: true });
+        }
         for (const { node, top, left } of listScroll.current) {
             node.scrollTop = top; node.scrollLeft = left;
         }
     }, [comparing]);
 
-    function openComparison() {
+    useLayoutEffect(() => {
+        if (!saveFocusRequest || saveFocusRequest === lastSaveFocus.current) return;
+        if (comparing) {
+            setComparing(false);
+            return;
+        }
+        lastSaveFocus.current = saveFocusRequest;
+        runNameRef.current?.focus();
+    }, [comparing, saveFocusRequest]);
+
+    function openComparison(trigger: HTMLButtonElement, variationPair?: { current: string; baseline: string }) {
         const nodes = Array.from(listRef.current?.querySelectorAll<HTMLElement>('.saved-table-scroll') ?? []);
         let ancestor: HTMLElement | null = listRef.current;
         while (ancestor) { nodes.push(ancestor); ancestor = ancestor.parentElement; }
         listScroll.current = nodes.map((node) => ({ node, top: node.scrollTop, left: node.scrollLeft }));
+        comparisonTrigger.current = trigger;
+        if (variationPair) setComparisonSelection([variationPair.current, variationPair.baseline]);
+        setShowRecipeChanges(variationPair !== undefined);
         setComparing(true);
     }
 
@@ -240,6 +269,7 @@ function RunHistoryContent({ saveController }: { saveController: SaveCurrentRunC
             <label style={{ display: 'grid', gap: 4, marginBottom: 8 }}>
                 <span>Run name</span>
                 <input
+                    ref={runNameRef}
                     type="text"
                     value={runTitle}
                     onChange={(event) => setRunTitle(event.currentTarget.value)}
@@ -270,6 +300,10 @@ function RunHistoryContent({ saveController }: { saveController: SaveCurrentRunC
             </button>
             </div>
 
+            {offeredBaseline && offeredVariation && offeredBaseline.id !== offeredVariation.id && <div className="saved-variation-offer">
+                <p role="status">Saved {recordLabel(offeredVariation)}. Its baseline is {recordLabel(offeredBaseline)}.</p>
+                <button type="button" onClick={(event) => openComparison(event.currentTarget, { current: offeredVariation.id, baseline: offeredBaseline.id })}>Compare with baseline</button>
+            </div>}
             {(actionError || (saveController.error && saveController.error !== persistenceError?.message)) && <div className="inspection__empty" role="alert" style={{ marginTop: 8 }}>{actionError || saveController.error}</div>}
             {legacyRaw !== null && !legacyNoticeDismissed && (
                 <section
@@ -370,18 +404,23 @@ function RunHistoryContent({ saveController }: { saveController: SaveCurrentRunC
                                 <td data-label="Test loss">{formatMetric(record.snapshot.evaluation.test.values.dataLoss)}</td>
                                 <td data-label="Actions"><details><summary>Actions<span className="saved-sr-only"> for {comparisonRecordLabel(record, records)}</span></summary><div className="saved-actions">
                                     <RenameRun record={record} />
+                                    {onTryVariation && <button type="button" disabled={variationDisabled || prepared === null} onClick={() => onTryVariation(record)}>Try a variation</button>}
                                     <ConfirmAction label="Apply saved recipe" title="Apply saved recipe" descriptionId={savedRecipeEffectsId} onConfirm={() => applySavedRecipe(record)}>{STATE_EFFECTS['saved-recipe-apply']} This starts a fresh model; saved trained parameters are not available.</ConfirmAction>
                                     <button type="button" aria-label={`Download evidence for ${recordLabel(record)}`} onClick={() => { try { downloadText(`${record.id}.json`, JSON.stringify(record, null, 2), setActionError); } catch (error) { setActionError(`Download failed: ${String(error)}`); } }}>Download evidence</button>
+                                    <button type="button" onClick={() => {
+                                        setActionError(null);
+                                        downloadText(`${record.id}-evaluation.csv`, savedEvaluationCsv(record.snapshot), setActionError, 'text/csv;charset=utf-8');
+                                    }}>Download evaluation CSV</button>
                                     <ConfirmAction label={`Delete ${recordLabel(record)}`} title="Delete saved run" onConfirm={() => deleteSavedRecord(record.id)}>Delete {recordLabel(record)} permanently? Download the evidence first to keep a copy.</ConfirmAction>
                                 </div></details></td>
                             </tr>)}
                         </tbody></table></div>
-                        <div className="saved-selection"><span>{selectedComparisonIds.length} runs selected</span><button type="button" onClick={() => setComparisonSelection([])}>Clear</button><button ref={compareButtonRef} className="saved-primary" type="button" disabled={selectedComparisonRecords.length !== 2} onClick={openComparison}>Compare selected</button></div>
+                        <div className="saved-selection"><span>{selectedComparisonIds.length} runs selected</span><button type="button" onClick={() => setComparisonSelection([])}>Clear</button><button ref={compareButtonRef} className="saved-primary" type="button" disabled={selectedComparisonRecords.length !== 2} onClick={(event) => openComparison(event.currentTarget)}>Compare selected</button></div>
                     </fieldset>
                 </>
             )}
             </div>
-            {comparing && selectedComparisonRecords.length === 2 && <SavedRunComparison current={selectedComparisonRecords[0]} baseline={selectedComparisonRecords[1]} currentLabel={comparisonRecordLabel(selectedComparisonRecords[0], records)} baselineLabel={comparisonRecordLabel(selectedComparisonRecords[1], records)} onBack={() => setComparing(false)} />}
+            {comparing && selectedComparisonRecords.length === 2 && <SavedRunComparison current={selectedComparisonRecords[0]} baseline={selectedComparisonRecords[1]} currentLabel={comparisonRecordLabel(selectedComparisonRecords[0], records)} baselineLabel={comparisonRecordLabel(selectedComparisonRecords[1], records)} showRecipeChanges={showRecipeChanges} onBack={() => setComparing(false)} />}
         </div>
     );
 }

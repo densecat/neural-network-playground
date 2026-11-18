@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { StoredLearningChart } from './StoredLearningChart.tsx';
+import { RecipeChanges } from './RecipeChanges.tsx';
 import type { ExperimentRunRecordV2 } from '@nn-playground/shared';
 
 function primaryRows(record: ExperimentRunRecordV2): Record<string, string> {
@@ -36,9 +37,9 @@ function displayValue(key: string, value: string) {
     return value;
 }
 
-export function SavedRunComparison({ current, baseline, currentLabel, baselineLabel, onBack }: {
+export function SavedRunComparison({ current, baseline, currentLabel, baselineLabel, showRecipeChanges, onBack }: {
     current: ExperimentRunRecordV2; baseline: ExperimentRunRecordV2;
-    currentLabel: string; baselineLabel: string; onBack(): void;
+    currentLabel: string; baselineLabel: string; showRecipeChanges?: boolean; onBack(): void;
 }) {
     const heading = useRef<HTMLHeadingElement>(null);
     useEffect(() => { heading.current?.focus(); }, []);
@@ -58,6 +59,10 @@ export function SavedRunComparison({ current, baseline, currentLabel, baselineLa
         <h2 ref={heading} tabIndex={-1}>Compare experiments</h2>
         <p>{summary}</p>
         {!comparable && <p>Dataset and objective identities must both match before losses can be ranked.</p>}
+        {showRecipeChanges && <section aria-label="Recipe changes">
+            <h3>Recipe changes</h3>
+            <RecipeChanges baseline={baseline.recipe} variation={current.recipe} />
+        </section>}
         <h3>Stored learning history</h3><div className="saved-learning-pair"><StoredLearningChart record={current} label={currentLabel} maximumStep={maximumStep} maximumLoss={maximumLoss} /><StoredLearningChart record={baseline} label={baselineLabel} maximumStep={maximumStep} maximumLoss={maximumLoss} /></div>
         <label className="saved-differences"><input type="checkbox" checked={differences} onChange={(event) => setDifferences(event.target.checked)} />Only show differences</label>
         <div className="saved-table-scroll" role="region" aria-label="Configuration and evidence" tabIndex={0}><table className="saved-comparison-table"><thead><tr><th scope="col">Configuration and evidence</th><th scope="col">{currentLabel}</th><th scope="col">{baselineLabel}</th></tr></thead><tbody>

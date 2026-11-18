@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_EXPERIMENT_DOCUMENT, PREPARED_PRESETS } from '@nn-playground/shared';
 import type { ExperimentRunRecordV2 } from '@nn-playground/shared';
 import { useSaveCurrentRun } from './useSaveCurrentRun.ts';
+import type { AppliedVariation } from './useRecipeDraft.ts';
 import { useExperimentMemoryStore, EXPERIMENT_MEMORY_STORAGE_KEY } from '../store/experimentMemoryStore.ts';
 import { usePlaygroundStore } from '../store/usePlaygroundStore.ts';
 import { currentPreparedForTest } from '../test/playgroundStoreTestUtils.ts';
@@ -74,6 +75,32 @@ describe('one shared current-run capture controller', () => {
         expect(JSON.stringify(useExperimentMemoryStore.getState().records[0])).toBe(bytes);
         expect(localStorage.getItem(EXPERIMENT_MEMORY_STORAGE_KEY)).toContain(bytes);
         expect(result.current.pending).toBe(false);
+    });
+
+    it('offers only the successfully saved variation and retains its baseline across a retry', async () => {
+        const prepared = currentPreparedForTest()!;
+        const baseline = makeSavedRunRecord(PREPARED_PRESETS.at(-1)!.prepared);
+        const variationId = '00000000-0000-0000-0000-000000000002';
+        const unrelatedId = '00000000-0000-0000-0000-000000000003';
+        vi.spyOn(crypto, 'randomUUID').mockReturnValueOnce(unrelatedId).mockReturnValueOnce(variationId);
+        workerApi.captureRunArtifact.mockImplementation(async ({ id }: { id: string }) => makeSavedRunRecord(prepared, id));
+        await act(async () => { expect(await useExperimentMemoryStore.getState().saveRecord(baseline)).toBe(true); });
+        const variation: AppliedVariation = { baselineId: baseline.id, generationId: 2, recipeFingerprint: prepared.identities.recipeFingerprint };
+        const { result, rerender } = renderHook<ReturnType<typeof useSaveCurrentRun>, { applied: AppliedVariation | null }>(
+            ({ applied }) => useSaveCurrentRun(applied),
+            { initialProps: { applied: variation } },
+        );
+        await act(async () => { expect(await result.current.commands.save()).toBe(true); });
+        expect(result.current.comparisonOffer).toBeNull();
+
+        const writes = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('quota'); });
+        await act(async () => { expect(await result.current.commands.save()).toBe(false); });
+        expect(result.current.comparisonOffer).toBeNull();
+        rerender({ applied: null });
+        writes.mockRestore();
+        await act(async () => { expect(await result.current.commands.retry()).toBe(true); });
+        expect(workerApi.captureRunArtifact).toHaveBeenCalledTimes(2);
+        expect(result.current.comparisonOffer).toEqual({ baselineId: baseline.id, variationId });
     });
 
     it('downloads byte-identical pending evidence after live recipe changes and retains it for retry', async () => {

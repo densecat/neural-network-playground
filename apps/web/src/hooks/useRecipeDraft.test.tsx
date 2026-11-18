@@ -5,6 +5,7 @@ import { useRecipeDraft } from './useRecipeDraft.ts';
 import { usePlaygroundStore } from '../store/usePlaygroundStore.ts';
 import { useTrainingStore } from '../store/useTrainingStore.ts';
 import * as recipeCommit from '../store/commitRecipeEdit.ts';
+import { makeSavedRunRecord } from '../test/savedRunFixtures.ts';
 const originalCommitPrepared = recipeCommit.commitRecipeEditPrepared;
 afterEach(() => vi.restoreAllMocks());
 const originalEdit = usePlaygroundStore.getState().editRecipe;
@@ -20,9 +21,54 @@ beforeEach(async () => {
     usePlaygroundStore.setState({editRecipe:originalEdit});
     await usePlaygroundStore.getState().replaceDocument(DEFAULT_EXPERIMENT_DOCUMENT);
     useTrainingStore.getState().finishConfigChange();
-    useTrainingStore.setState({configError:null,configErrorSource:null,trainedRecipeFingerprint:null,trainedRecipeSource:null});
+    useTrainingStore.setState({configError:null,configErrorSource:null,trainedRecipeFingerprint:null,trainedRecipeSource:null,evidenceGenerationId:null});
 });
 describe('session recipe draft', () => {
+    it('stages the saved recipe without switching the active run and only tracks a changed, acknowledged variation', async () => {
+        const active = prepared();
+        const baseline = makeSavedRunRecord(PREPARED_PRESETS.at(-1)!.prepared);
+        const { result } = renderHook(useRecipeDraft);
+        act(() => {
+            useTrainingStore.setState({ evidenceGenerationId: 17 });
+            expect(result.current.commands.variation(baseline)).toBe(true);
+        });
+        expect(result.current.variationBaseline).toBe(baseline);
+        expect(result.current.recipe).toEqual(baseline.recipe);
+        expect(result.current.dirty).toBe(true);
+        expect(result.current.canApply).toBe(false);
+        expect(prepared()).toBe(active);
+        expect(useTrainingStore.getState().pendingConfigSource).toBeNull();
+
+        act(() => result.current.commands.cancel());
+        expect(result.current.variationBaseline).toBeNull();
+        expect(result.current.recipe).toEqual(active.document.recipe);
+
+        act(() => {
+            expect(result.current.commands.variation(baseline)).toBe(true);
+            result.current.commands.number('training.learningRate', '0.123');
+            expect(result.current.commands.variation(baseline)).toBe(false);
+        });
+        expect(result.current.canApply).toBe(true);
+        let apply!: Promise<boolean>;
+        act(() => { apply = result.current.commands.apply(); });
+        await waitFor(() => expect(prepared().document.recipe.training.learningRate).toBe(0.123));
+        const variationIdentities = prepared().identities;
+        await act(async () => {
+            await usePlaygroundStore.getState().editView((view) => ({ ...view, showTestData: !view.showTestData }));
+        });
+        expect(prepared().identities).toBe(variationIdentities);
+        expect(result.current.submitted).toBe(true);
+        expect(result.current.appliedVariation).toBeNull();
+        act(() => useTrainingStore.setState({ evidenceGenerationId: 18 }));
+        await acknowledge();
+        expect(await apply).toBe(true);
+        expect(result.current.variationBaseline).toBeNull();
+        expect(result.current.appliedVariation).toEqual({
+            baselineId: baseline.id,
+            generationId: 18,
+            recipeFingerprint: prepared().identities.recipeFingerprint,
+        });
+    });
     it('keeps cross-section changes local and cancels all of them', () => {
         const original=prepared();const {result}=renderHook(useRecipeDraft);
         act(() => {result.current.commands.number('data.noise','12');result.current.commands.number('model.seed','11');result.current.commands.number('training.learningRate','0.1');});

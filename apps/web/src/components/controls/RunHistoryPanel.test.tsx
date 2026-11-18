@@ -80,6 +80,106 @@ describe('RunHistoryPanel V2 evidence memory', () => {
         expect(workerApi.captureRunArtifact).not.toHaveBeenCalled();
     });
 
+    it('focuses the run name only when explicitly requested', () => {
+        const { rerender } = render(<RunHistoryPanel />);
+        const input = screen.getByRole('textbox', { name: 'Run name' });
+        expect(input).not.toHaveFocus();
+        rerender(<RunHistoryPanel saveFocusRequest={1} />);
+        expect(input).toHaveFocus();
+        const save = screen.getByRole('button', { name: 'Save current run' });
+        save.focus();
+        rerender(<RunHistoryPanel saveFocusRequest={1} />);
+        expect(save).toHaveFocus();
+    });
+
+    it('downloads recorded evaluations and distinctly labelled batch trends from the saved JSON', async () => {
+        const stored = makeSavedRunRecord(currentPreparedForTest()!, IDS[0], 'CSV fixture');
+        const evaluation = stored.snapshot.evaluation;
+        const initial = { ...evaluation, evaluationId: 1, trigger: 'initial' as const, model: { ...evaluation.model, revision: 0, step: 0 } };
+        await act(async () => {
+            expect(await useExperimentMemoryStore.getState().saveRecord({
+                ...stored,
+                snapshot: {
+                    ...stored.snapshot,
+                    trendHistory: [{
+                        dataset: evaluation.dataset,
+                        objectiveKey: evaluation.objectiveKey,
+                        model: { ...evaluation.model, revision: 2, step: 2 },
+                        basis: { kind: 'mini-batch-ema', latestBatchSize: 10, throughStep: 2, alpha: 0.1 },
+                        dataLoss: 0.4571834501234567,
+                    }],
+                    evaluationHistory: [initial, evaluation],
+                },
+            })).toBe(true);
+        });
+        const { records: [fixture] }: { records: ExperimentRunRecordV2[] } = JSON.parse(localStorage.getItem(EXPERIMENT_MEMORY_STORAGE_KEY)!);
+        const create = vi.fn((_blob: Blob) => 'blob:evaluation');
+        const revoke = vi.fn();
+        vi.stubGlobal('URL', class extends URL { static createObjectURL = create; static revokeObjectURL = revoke; });
+        const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+            expect(this.download).toBe(`${fixture.id}-evaluation.csv`);
+        });
+        try {
+            render(<RunHistoryPanel />);
+            await openActions();
+            await userEvent.click(screen.getByRole('button', { name: 'Download evaluation CSV' }));
+            expect(click).toHaveBeenCalledOnce();
+            expect(revoke).toHaveBeenCalledWith('blob:evaluation');
+            const blob = create.mock.calls[0][0];
+            expect(blob.type).toBe('text/csv;charset=utf-8');
+            const csv = await new Promise<string>((resolve) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(String(reader.result));
+                reader.readAsText(blob);
+            });
+            const [header, ...rows] = csv.trimEnd().split('\r\n');
+            expect(header).toBe('series,step,revision,train_sample_count,test_sample_count,train_data_loss,test_data_loss,train_total_objective,batch_sample_count,batch_ema_data_loss');
+            const [first, last] = fixture.snapshot.evaluationHistory.map((point) => [
+                'full-evaluation', point.model.step, point.model.revision,
+                point.train.basis.sampleCount, point.test.basis.sampleCount,
+                point.train.values.dataLoss, point.test.values.dataLoss, point.objective.trainTotalObjective, '', '',
+            ].join(','));
+            const [trend] = fixture.snapshot.trendHistory;
+            const batch = ['mini-batch-ema', trend.model.step, trend.model.revision, '', '', '', '', '', trend.basis.latestBatchSize, trend.dataLoss].join(',');
+            expect(rows).toEqual([first, batch, last]);
+            expect(workerApi.captureRunArtifact).not.toHaveBeenCalled();
+        } finally { vi.unstubAllGlobals(); }
+    });
+
+    it('compares a saved variation with its named baseline through the existing identity guard', async () => {
+        const baseline = makeSavedRunRecord(preset('circle-one-layer'), IDS[0], 'Baseline', 0.6);
+        const unrelated = makeSavedRunRecord(preset('circle-one-layer'), IDS[1], 'Unrelated', 0.5);
+        const variation = makeSavedRunRecord(preset('regression-plane'), IDS[2], 'Variation', 0.4);
+        await act(async () => {
+            for (const record of [baseline, unrelated, variation]) {
+                expect(await useExperimentMemoryStore.getState().saveRecord(record)).toBe(true);
+            }
+        });
+        const onTryVariation = vi.fn();
+        const commands = { save: vi.fn(async () => true), retry: vi.fn(async () => true),
+            discard: vi.fn(async () => {}), downloadPending: vi.fn(async () => true), dismiss: vi.fn() };
+        render(<RunHistoryPanel onTryVariation={onTryVariation} saveController={{
+            busy: false, error: null, pending: false, disabledReason: null, commands,
+            comparisonOffer: { baselineId: baseline.id, variationId: variation.id },
+        }} />);
+        const baselineRow = screen.getByRole('article', { name: 'Baseline' }).closest('tr')!;
+        await userEvent.click(within(baselineRow).getByText('Actions', { exact: false, selector: 'summary' }));
+        await userEvent.click(within(baselineRow).getByRole('button', { name: 'Try a variation' }));
+        expect(onTryVariation).toHaveBeenCalledWith(expect.objectContaining({ id: baseline.id }));
+
+        const compare = screen.getByRole('button', { name: 'Compare with baseline' });
+        await userEvent.click(compare);
+        const result = screen.getByRole('group', { name: 'Saved run comparison: Variation and Baseline' });
+        expect(result).toHaveTextContent('Not directly comparable');
+        expect(result).not.toHaveTextContent('Unrelated');
+        expect(within(result).getByRole('region', { name: 'Recipe changes' })).toHaveTextContent('Dataset');
+        await userEvent.click(screen.getByRole('button', { name: '← Saved runs' }));
+        expect(compare).toHaveFocus();
+
+        await act(async () => { await useExperimentMemoryStore.getState().removeRecord(baseline.id); });
+        expect(compare).not.toBeInTheDocument();
+    });
+
     it('retains the shared capture guard when the History drawer unmounts and reopens', async () => {
         let finish!: (record: ExperimentRunRecordV2) => void;
         workerApi.captureRunArtifact.mockImplementation(() => new Promise<ExperimentRunRecordV2>((resolve) => { finish = resolve; }));

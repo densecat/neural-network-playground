@@ -1,0 +1,5 @@
+.atelier-recipe-changes { display: grid; gap: 8px; margin: 12px 0 20px; }
+.atelier-recipe-changes > div { display: flex; flex-wrap: wrap; gap: 4px 16px; }
+.atelier-recipe-changes dt { font-weight: 600; }
+.atelier-recipe-changes dd { margin: 0; overflow-wrap: anywhere; }
+.atelier-variation-heading { overflow-wrap: anywhere; }

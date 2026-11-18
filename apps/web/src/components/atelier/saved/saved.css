@@ -30,6 +30,7 @@
 @media (max-width: 700px) { .saved-run-table { min-width: 0; } .saved-run-table thead { display: none; } .saved-run-table tbody, .saved-run-table tr, .saved-run-table td { display: block; } .saved-run-table tr { border-bottom: 1px solid var(--border-color); padding: 16px 0; } .saved-run-table td { border: 0; padding: 6px 0; max-width: none !important; } .saved-run-table td::before { content: attr(data-label); display: inline-block; color: var(--text-secondary); width: 100px; } .saved-run-table td:nth-child(2)::before { display: none; } .saved-run-table td:nth-child(2) { padding: 12px 0; } .saved-selection .saved-primary { margin-left: 0; } }
 
 .saved-capture { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 32px; margin: 24px 0; }
+.saved-variation-offer { margin: 24px 0; overflow-wrap: anywhere; }
 @media (max-width: 700px) { .saved-capture { grid-template-columns: 1fr; gap: 8px; } }
 
 .saved-learning-pair {display:grid;grid-template-columns:1fr 1fr;gap:24px;margin:32px 0}

@@ -3,6 +3,14 @@ import { EXPERIMENT_MEMORY_MAX_TITLE_CODE_POINTS } from '@nn-playground/shared';
 import { useExperimentMemoryStore } from '../store/experimentMemoryStore.ts';
 import { captureCurrentRun } from './captureCurrentRun.ts';
 import { usePlaygroundStore } from '../store/usePlaygroundStore.ts';
+import type { AppliedVariation } from './useRecipeDraft.ts';
+
+interface VariationComparison {
+    readonly baselineId: string;
+    readonly variationId: string;
+}
+
+type PendingVariationComparison = VariationComparison & { readonly generationId: number };
 
 /** Shared by the transport and History; App owns the production instance. */
 export interface SaveCurrentRunController {
@@ -10,6 +18,7 @@ export interface SaveCurrentRunController {
     readonly error: string | null;
     readonly disabledReason: string | null;
     readonly pending: boolean;
+    readonly comparisonOffer?: VariationComparison | null;
     readonly commands: {
         readonly save: (title?: string) => Promise<boolean>;
         readonly retry: () => Promise<boolean>;
@@ -28,7 +37,7 @@ function saveDisabledReason(busy: boolean): string | null {
     return null;
 }
 
-export function useSaveCurrentRun(): SaveCurrentRunController {
+export function useSaveCurrentRun(variation: AppliedVariation | null = null): SaveCurrentRunController {
     // Subscribe to display changes; command guards read current stores synchronously
     // so two surfaces cannot race between an event and the next React render.
     const hydrationStatus = useExperimentMemoryStore((state) => state.hydrationStatus);
@@ -37,6 +46,9 @@ export function useSaveCurrentRun(): SaveCurrentRunController {
     const accessStatus = usePlaygroundStore((state) => state.access.status);
     const [busy, setBusy] = useState(false);
     const [actionError, setActionError] = useState<string | null>(null);
+    const [comparisonOffer, setComparisonOffer] = useState<VariationComparison | null>(null);
+    const pendingComparison = useRef<PendingVariationComparison | null>(null);
+    const offeredGeneration = useRef<number | null>(null);
     const busyRef = useRef(false);
     const mounted = useRef(true);
     useEffect(() => {
@@ -59,6 +71,13 @@ export function useSaveCurrentRun(): SaveCurrentRunController {
         }
     }, []);
 
+    const completeComparison = useCallback((comparison: PendingVariationComparison | null) => {
+        if (!comparison) return;
+        offeredGeneration.current = comparison.generationId;
+        const { baselineId, variationId } = comparison;
+        if (mounted.current) setComparisonOffer({ baselineId, variationId });
+    }, []);
+
     const save = useCallback(async (title = '') => {
         const trimmed = title.trim();
         if (saveDisabledReason(busyRef.current)
@@ -66,16 +85,33 @@ export function useSaveCurrentRun(): SaveCurrentRunController {
         const timestamp = new Date().toISOString();
         return operate(async () => {
             const artifact = await captureCurrentRun(trimmed, timestamp);
-            return useExperimentMemoryStore.getState().saveRecord(artifact);
+            const comparison = variation && offeredGeneration.current !== variation.generationId
+                && artifact.snapshot.model.generationId === variation.generationId
+                && artifact.recipeFingerprint === variation.recipeFingerprint
+                ? { baselineId: variation.baselineId, variationId: artifact.id, generationId: variation.generationId }
+                : null;
+            const saved = await useExperimentMemoryStore.getState().saveRecord(artifact);
+            pendingComparison.current = !saved && useExperimentMemoryStore.getState().pendingSave?.id === artifact.id
+                ? comparison
+                : null;
+            if (saved) completeComparison(comparison);
+            return saved;
         });
-    }, [operate]);
-    const retry = useCallback(() => operate(() => (
+    }, [completeComparison, operate, variation]);
+    const retry = useCallback(() => operate(async () => {
         // Never contact the worker, mint an ID, or read the current recipe here.
-        useExperimentMemoryStore.getState().retryPersistence()
-    )), [operate]);
+        const pendingId = useExperimentMemoryStore.getState().pendingSave?.id;
+        const saved = await useExperimentMemoryStore.getState().retryPersistence();
+        if (saved) {
+            if (pendingComparison.current?.variationId === pendingId) completeComparison(pendingComparison.current);
+            pendingComparison.current = null;
+        }
+        return saved;
+    }), [completeComparison, operate]);
     const discard = useCallback(async () => {
         await operate(async () => {
             await useExperimentMemoryStore.getState().discardPendingSave();
+            pendingComparison.current = null;
             return true;
         });
     }, [operate]);
@@ -100,7 +136,7 @@ export function useSaveCurrentRun(): SaveCurrentRunController {
     void hydrationStatus;
     void accessStatus;
     return {
-        busy, pending: pendingSave !== null,
+        busy, pending: pendingSave !== null, comparisonOffer,
         error: actionError ?? persistenceError?.message ?? null,
         disabledReason: saveDisabledReason(busy),
         commands: { save, retry, discard, downloadPending, dismiss },
