@@ -9,8 +9,10 @@ async function stepTo(page: Page, step: number): Promise<void> {
 async function exportParameters(page: Page, step: number): Promise<string> {
     await utility(page, 'Export / import');
     const dialog = page.getByRole('dialog', { name: 'Export / import' });
-    await dialog.getByRole('tab', { name: 'Code', exact: true }).click();
-    await dialog.getByRole('tab', { name: 'NumPy', exact: true }).click();
+    for (const name of ['Code', 'NumPy']) {
+        const tab = dialog.getByRole('tab', { name, exact: true });
+        if (await tab.getAttribute('aria-selected') !== 'true') await tab.click();
+    }
     await expect(dialog).toContainText(`Parameter snapshot: step ${step}.`);
     const code = dialog.getByRole('tabpanel', { name: 'NumPy' });
     await expect(code).toContainText('# Trained weights');

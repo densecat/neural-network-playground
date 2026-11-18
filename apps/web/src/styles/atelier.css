@@ -41,18 +41,18 @@ button:disabled {cursor:not-allowed;opacity:.48}
 .atelier button,.atelier-dialog button,.atelier select,.atelier-dialog select {color:inherit}
 .atelier button:not(.btn):where(:not(.saved-primary)),.atelier-dialog button:not(.btn) {border:1px solid var(--border-color);border-radius:3px;padding:8px 14px;background:transparent}
 .atelier .atelier-primary,.atelier-dialog .atelier-primary,.atelier .atelier-action {background:var(--action-bg)!important;color:var(--action-text)!important;border-color:var(--action-bg)!important;font-weight:600}
- .atelier-header {position:static;top:0;z-index:30;background:var(--bg-primary);min-height:88px;display:flex;align-items:center;gap:48px;padding:16px max(24px,calc((100vw - 1440px)/2));border-bottom:1px solid var(--border-color)}
+ .atelier-header {position:static;top:0;z-index:30;background:var(--bg-primary);min-height:88px;display:flex;flex-wrap:wrap;align-items:center;gap:48px;padding:16px max(24px,calc((100vw - 1440px)/2));border-bottom:1px solid var(--border-color)}
 .atelier-header .atelier-wordmark {font-family:var(--font-mono);font-size:23px;font-weight:700;letter-spacing:-1px;border:0;padding:0;white-space:nowrap}
 .atelier-wordmark span {color:var(--color-primary)}
-.atelier-header nav,.atelier-header-end {display:flex;align-items:center;gap:24px}
+.atelier-header nav,.atelier-header-end {display:flex;flex-wrap:wrap;align-items:center;gap:24px;max-width:100%}
 .atelier-header nav button,.atelier-header .atelier-lessons-link {border:0;padding:8px 0;color:var(--text-secondary)}
 .atelier-header nav button[aria-current],.atelier-header .atelier-lessons-link[aria-current] {color:var(--text-primary)}
-.atelier-header-end {margin-left:auto}
+.atelier-header-end {margin-left:auto;justify-content:flex-end}
 .atelier-theme {display:flex;align-items:center;gap:6px;font-size:14px}
 .atelier-theme select {background:var(--bg-primary);color:inherit;border:0;height:44px;min-height:44px;padding:0 8px}
 .atelier-menu {position:relative}
 .atelier .atelier-icon-button,.atelier-dialog .atelier-icon-button {display:inline-flex;align-items:center;justify-content:center;width:44px;flex-shrink:0;padding:8px}
-.atelier-menu-items {position:absolute;right:0;top:calc(100% + 8px);z-index:40;min-width:230px;padding:8px;border:1px solid var(--border-color);background:var(--bg-primary);box-shadow:0 8px 24px #0002}
+.atelier-menu-items {position:absolute;right:0;top:calc(100% + 8px);z-index:40;width:min(230px,calc(var(--atelier-viewport-width,100vw) - 32px));padding:8px;border:1px solid var(--border-color);background:var(--bg-primary);box-shadow:0 8px 24px #0002}
 .atelier-menu-items button {display:block;width:100%;text-align:left;border:0!important}
 .atelier-menu-items button:hover {background:var(--bg-secondary)!important}
 .atelier-main {max-width:1440px;margin:0 auto;padding:24px 32px 24px;min-width:0}

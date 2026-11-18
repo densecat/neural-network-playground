@@ -1,16 +1,15 @@
-import { memo, useMemo, type CSSProperties } from 'react';
+import { memo, useMemo, type CSSProperties, type ReactNode } from 'react';
 import { usePlaygroundStore } from '../../store/usePlaygroundStore.ts';
 import { useTrainingStore } from '../../store/useTrainingStore.ts';
 import { NetworkGraph } from '../visualization/NetworkGraph.tsx';
 import { NetworkSelectionDeck } from '../visualization/NetworkSelectionDeck.tsx';
-import type { DecisionOverlayPreference } from '../visualization/useDecisionBoundaryController.ts';
-import { useNetworkSelectionModel, type NetworkSelectionState } from '../visualization/useNetworkSelectionController.ts';
+import type { NetworkSelectionController } from '../visualization/useNetworkSelectionController.ts';
 import type { SetupTab } from '../../productShell/atelierTypes.ts';
 import { Icon, Tabs } from './ui.tsx';
 import { getDatasetContract } from '@nn-playground/engine';
 import { useThemeStore, readPlotPalette } from '../../store/theme.ts';
 import { CLASS_COLORS, fieldColor, hexRgb } from '../visualization/plotColors.ts';
-import { AtelierPrediction, DatasetPlotStatus, selectDatasetPlotStatus } from './AtelierPrediction.tsx';
+import { DatasetPlotStatus, selectDatasetPlotStatus } from './AtelierPrediction.tsx';
 
 const DataPlot = memo(function DataPlot() {
     const status = useTrainingStore(selectDatasetPlotStatus);
@@ -38,22 +37,21 @@ const DataPlot = memo(function DataPlot() {
 });
 
 export type NetworkRegion = 'data' | 'network' | 'prediction';
-interface AtelierNetworkProps {
+export interface AtelierNetworkProps {
     layout: 'compact' | 'stacked' | 'wide';
     region: NetworkRegion;
     onRegionChange(region: NetworkRegion): void;
-    overlay: DecisionOverlayPreference;
-    selection: NetworkSelectionState;
+    prediction: ReactNode;
+    graph: NetworkSelectionController;
     onSetup(tab: SetupTab): void;
     onResults(): void;
 }
 
-export function AtelierNetwork({ layout, region, onRegionChange, overlay, selection, onSetup, onResults }: AtelierNetworkProps) {
+export function AtelierNetwork({ layout, region, onRegionChange, prediction, graph, onSetup, onResults }: AtelierNetworkProps) {
     const compact = layout === 'compact';
     const showData = !compact || region === 'data';
     const showNetwork = !compact || region === 'network';
     const showPrediction = !compact || region === 'prediction';
-    const graph = useNetworkSelectionModel(selection, showNetwork);
     const dataPanel = <section key="data" className="atelier-network-data" hidden={!showData}>
         <div className="atelier-section-title"><h2>Data</h2><button type="button" onClick={() => onSetup('dataset')} aria-label="Edit dataset"><Icon name="settings" /></button></div>
         {showData && <DataPlot />}
@@ -68,7 +66,7 @@ export function AtelierNetwork({ layout, region, onRegionChange, overlay, select
             {layout === 'wide' ? [dataPanel, networkPanel] : [networkPanel, dataPanel]}
             <section className="atelier-network-prediction" hidden={!showPrediction}>
                 <div className="atelier-section-title"><h2>Prediction</h2><button type="button" onClick={onResults} aria-label="Expand prediction results"><Icon name="expand" /></button></div>
-                {showPrediction && <AtelierPrediction overlay={overlay} />}
+                {showPrediction && prediction}
             </section>
         </div>
         {graph.model.kind === 'selected' && <div className="atelier-neuron-detail"><NetworkSelectionDeck model={graph.model} onClear={graph.commands.clearSelection} /></div>}

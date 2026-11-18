@@ -1,8 +1,7 @@
-import { memo } from 'react';
-import { useTrainingStore, type DatasetStatus, type TrainingStore } from '../../store/useTrainingStore.ts';
+import type { DatasetStatus, TrainingStore } from '../../store/useTrainingStore.ts';
 import { BoundaryEvidencePanel } from '../visualization/BoundaryEvidencePanel.tsx';
 import { DecisionBoundaryCanvas } from '../visualization/DecisionBoundaryCanvas.tsx';
-import { useDecisionBoundaryController, type DecisionOverlayPreference } from '../visualization/useDecisionBoundaryController.ts';
+import type { DecisionBoundaryController } from '../visualization/useDecisionBoundaryController.ts';
 
 export function selectDatasetPlotStatus({ datasetStatus, runtimeSyncPending }: Pick<TrainingStore, 'datasetStatus' | 'runtimeSyncPending'>): DatasetStatus {
     return datasetStatus === 'ready' && runtimeSyncPending ? 'loading' : datasetStatus;
@@ -16,14 +15,7 @@ export function DatasetPlotStatus({ className, status }: { className: string; st
     </div>;
 }
 
-export const AtelierPrediction = memo(function AtelierPrediction({ overlay, details = false }: { overlay: DecisionOverlayPreference; details?: boolean }) {
-    const status = useTrainingStore(selectDatasetPlotStatus);
-    if (status !== 'ready') return <DatasetPlotStatus className="decision-boundary" status={status} />;
-    return <PredictionEvidence overlay={overlay} details={details} />;
-});
-
-function PredictionEvidence({ overlay, details }: { overlay: DecisionOverlayPreference; details: boolean }) {
-    const boundary = useDecisionBoundaryController(overlay);
+export function AtelierPrediction({ boundary, details }: { boundary: DecisionBoundaryController; details: boolean }) {
     const { model } = boundary;
     return <>
         <DecisionBoundaryCanvas model={model} />

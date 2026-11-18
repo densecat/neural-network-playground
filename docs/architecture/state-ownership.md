@@ -25,10 +25,10 @@ persisted experiment document. Old layout storage is read without deletion.
 
 ## Production composition and adapters
 
-`App`/`CompatiblePlayground` owns the production `useTraining`,
-`useSaveCurrentRun`, `useNetworkSelectionController`, and
-`useDecisionBoundaryController` instances. `AtelierShell` composes their display
-models and commands. Hidden visualizations unmount while controllers survive.
+`AtelierShell` owns training, saving, the selected neuron, and the prediction
+overlay preference across navigation. Its mounted `NetworkWorkspace` and `PredictionEvidence`
+adapters subscribe to graph and boundary frames. The adapters pass those
+models to the corresponding visualizations.
 App alone derives demand from actual visibility, including the compact focused
 network region, and `useTraining` alone sends the cached demand to the worker.
 

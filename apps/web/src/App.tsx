@@ -1,5 +1,5 @@
 // App owns model lifetime, recipe drafts and visualization demand across navigation.
-import { lazy, Suspense, useEffect, useRef, useCallback, useState, type ComponentType, type ReactNode } from 'react';
+import { lazy, memo, Suspense, useEffect, useRef, useCallback, useState, type ComponentType, type ReactNode } from 'react';
 import { DEFAULT_DEMAND, type ExperimentRunRecordV2 } from '@nn-playground/shared';
 import { useLayoutStore } from './store/useLayoutStore.ts';
 import { useExperimentMemoryStore } from './store/experimentMemoryStore.ts';
@@ -12,11 +12,11 @@ import { useTraining } from './hooks/useTraining.ts';
 import { useAtelierViewport } from './hooks/useAtelierViewport.ts';
 import { useRecipeDraft } from './hooks/useRecipeDraft.ts';
 import { useExperimentMemoryStorageSync } from './hooks/useExperimentMemoryStorageSync.ts';
-import { useNetworkSelectionState } from './components/visualization/useNetworkSelectionController.ts';
-import { useDecisionOverlayPreference } from './components/visualization/useDecisionBoundaryController.ts';
+import { useNetworkSelectionModel, useNetworkSelectionState, type NetworkSelectionState } from './components/visualization/useNetworkSelectionController.ts';
+import { useDecisionBoundaryController, useDecisionOverlayPreference, type DecisionOverlayPreference } from './components/visualization/useDecisionBoundaryController.ts';
 import { AtelierHeader } from './components/atelier/AtelierHeader.tsx';
-import { AtelierNetwork, type NetworkRegion } from './components/atelier/AtelierNetwork.tsx';
-import { AtelierPrediction } from './components/atelier/AtelierPrediction.tsx';
+import { AtelierNetwork, type AtelierNetworkProps, type NetworkRegion } from './components/atelier/AtelierNetwork.tsx';
+import { AtelierPrediction, DatasetPlotStatus, selectDatasetPlotStatus } from './components/atelier/AtelierPrediction.tsx';
 import { AtelierTransport, EvidenceMetrics, getTrainingUnavailableReason } from './components/atelier/AtelierTransport.tsx';
 import { SetupEditor } from './components/atelier/setup/SetupEditor.tsx';
 import { CheckpointPanel } from './components/atelier/CheckpointPanel.tsx';
@@ -217,7 +217,7 @@ function AtelierShell() {
                     <ErrorBoundary key={workspaceTab} title="Workspace unavailable" description="This view could not render. Your experiment remains available in the other views.">
                     {workspaceTab === 'setup' && <SetupEditor controller={draft} tab={setupTab} onTabChange={(tab) => useLayoutStore.getState().setSetupTab(tab)} />}
                     {workspaceTab === 'network' && <>
-                        <AtelierNetwork
+                        <NetworkWorkspace
                             layout={networkLayout}
                             region={networkRegion}
                             onRegionChange={setNetworkRegion}
@@ -243,7 +243,7 @@ function AtelierShell() {
                         />
                         {effectiveResultsTab === 'boundary' && <>
                             <OptionalView title="Prediction unavailable">
-                                <div className="atelier-results-boundary"><AtelierPrediction overlay={overlay} details /></div>
+                                <div className="atelier-results-boundary"><PredictionWorkspace overlay={overlay} details /></div>
                             </OptionalView>
                             <EvidenceMetrics />
                         </>}
@@ -256,7 +256,7 @@ function AtelierShell() {
                         {effectiveResultsTab === 'errors' && <div className="atelier-results-errors">
                             <div className="atelier-error-map">
                                 <h2>Prediction field</h2>
-                                <OptionalView title="Prediction unavailable"><AtelierPrediction overlay={overlay} details /></OptionalView>
+                                <OptionalView title="Prediction unavailable"><PredictionWorkspace overlay={overlay} details /></OptionalView>
                             </div>
                             <OptionalView title="Confusion matrix unavailable"><ConfusionMatrix /></OptionalView>
                         </div>}
@@ -283,6 +283,28 @@ function AtelierShell() {
         </Dialog>}
         {workerError && <Dialog title="Worker connection lost" persistent backgroundRef={backgroundRef} description={`${workerError} Refresh the page to restart the playground.`} onClose={() => { /* Persistent recovery requires reload. */ }} alert><p>{workerError}</p><p>Refresh the page to restart the playground.</p><button type="button" className="atelier-primary" onClick={() => window.location.reload()}>Refresh page</button></Dialog>}
     </div>;
+}
+
+interface NetworkWorkspaceProps extends Omit<AtelierNetworkProps, 'graph' | 'prediction'> {
+    selection: NetworkSelectionState;
+    overlay: DecisionOverlayPreference;
+}
+
+// Controller state stays with the shell while frame subscriptions follow the evidence views.
+function NetworkWorkspace({ selection, overlay, ...view }: NetworkWorkspaceProps) {
+    const graph = useNetworkSelectionModel(selection, view.layout !== 'compact' || view.region === 'network');
+    return <AtelierNetwork {...view} graph={graph} prediction={<PredictionWorkspace overlay={overlay} />} />;
+}
+
+const PredictionWorkspace = memo(function PredictionWorkspace({ overlay, details = false }: { overlay: DecisionOverlayPreference; details?: boolean }) {
+    const status = useTrainingStore(selectDatasetPlotStatus);
+    if (status !== 'ready') return <DatasetPlotStatus className="decision-boundary" status={status} />;
+    return <PredictionEvidence overlay={overlay} details={details} />;
+});
+
+function PredictionEvidence({ overlay, details }: { overlay: DecisionOverlayPreference; details: boolean }) {
+    const boundary = useDecisionBoundaryController(overlay);
+    return <AtelierPrediction boundary={boundary} details={details} />;
 }
 
 function TrainingAnnouncements() {
