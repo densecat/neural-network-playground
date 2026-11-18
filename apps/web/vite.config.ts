@@ -2,6 +2,7 @@ import { defineConfig } from 'vite';
 import { configDefaults } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 
 // Cross-origin isolation headers are required for SharedArrayBuffer to be
 // available to the app (AS-3 snapshot fast path). When the headers are
@@ -16,7 +17,28 @@ const crossOriginIsolationHeaders = {
 };
 
 export default defineConfig(({ mode }) => ({
-    plugins: [react()],
+    plugins: [
+        react(),
+        {
+            name: 'shared-training-worker-modules',
+            apply: 'build',
+            enforce: 'pre',
+            resolveId(source) {
+                if (source === './training.worker.ts?worker&url') return '\0training-worker-url';
+            },
+            load(id) {
+                // A second entry in the same Rollup graph lets the page and
+                // the module worker share identical scientific/validation code.
+                if (id !== '\0training-worker-url') return;
+                const reference = this.emitFile({
+                    type: 'chunk',
+                    id: fileURLToPath(new URL('./src/worker/training.worker.ts', import.meta.url)),
+                    name: 'training.worker',
+                });
+                return `export default import.meta.ROLLUP_FILE_URL_${reference};`;
+            },
+        },
+    ],
     // Use hash-based routing, so base can be set for GH Pages subdirectory
     base: process.env.VITE_BASE ?? './',
     worker: {

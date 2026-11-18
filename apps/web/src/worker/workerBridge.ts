@@ -5,6 +5,7 @@
 // - rAF-gated rendering loop that applies at most one snapshot per animation frame
 
 import * as Comlink from 'comlink';
+import trainingWorkerUrl from './training.worker.ts?worker&url';
 import { releaseProxy } from 'comlink';
 import type { TrainingWorkerApi } from './training.worker.ts';
 import type {
@@ -259,10 +260,7 @@ async function waitForWorkerReadiness(worker: Worker): Promise<void> {
 
 function ensureWorker(): Worker {
     if (!_worker) {
-        const worker = new Worker(
-            new URL('./training.worker.ts', import.meta.url),
-            { type: 'module' },
-        );
+        const worker = new Worker(trainingWorkerUrl, { type: 'module' });
         _worker = worker;
         // Install readiness observation immediately after construction and
         // before Comlink can send the first RPC message.
