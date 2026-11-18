@@ -11,6 +11,8 @@ import {
     type WorkerEvidenceMessageV2,
     type WorkerArtifactProvenanceV2,
     type WorkerExperimentRequestV2,
+    decodeExperimentUrl,
+    encodeExperimentUrl,
     prepareExperimentDocument,
 } from '@nn-playground/shared';
 import type { WorkerToMainMessage } from '@nn-playground/shared';
@@ -1162,7 +1164,7 @@ describe('useTraining', () => {
 
         act(() => getStreamHandler()({ type: 'status', protocolVersion: 2, runId: 1, status: 'paused' }));
         await act(async () => stepPromise);
-        expect(bridge.workerApi.stepExperimentV2).toHaveBeenCalledWith(1);
+        expect(bridge.workerApi.stepExperimentV2).toHaveBeenCalledWith(1, 'current');
         expect(useTrainingStore.getState().pauseReason).toBe('manual');
     });
 
@@ -1625,6 +1627,80 @@ describe('useTraining', () => {
         unmount();
     });
 
+    it.each(['saved-run', 'url'] as const)('keeps the acknowledged model and retries the exact rejected %s request', async (source) => {
+        const { result } = renderHook(() => useTraining());
+        await waitFor(() => expect(useTrainingStore.getState().datasetStatus).toBe('ready'));
+        const candidate = {
+            ...INITIAL_PREPARED.document,
+            recipe: {
+                ...INITIAL_PREPARED.document.recipe,
+                model: { ...INITIAL_PREPARED.document.recipe.model, hiddenLayers: [3, 7] },
+            },
+        };
+        const api = bridge.workerApi;
+        api.initializeExperimentV2.mockRejectedValueOnce(new Error('recipe rejected'))
+            .mockRejectedValueOnce(new Error('retry rejected'));
+        await act(async () => {
+            const playground = usePlaygroundStore.getState();
+            if (source === 'url') {
+                window.history.replaceState(null, '', encodeExperimentUrl(candidate));
+                await playground.loadFromUrl();
+            } else {
+                await playground.replaceDocument(candidate, source);
+            }
+        });
+        await waitFor(() => expect(useTrainingStore.getState().configError).toBe('recipe rejected'));
+        expect(useTrainingStore.getState().configErrorSource).toBe(source);
+        const rejected = api.initializeExperimentV2.mock.lastCall![0] as WorkerExperimentRequestV2;
+        expect(rejected.document.recipe).toEqual(candidate.recipe);
+        act(() => useTrainingStore.getState().retryConfigSync());
+        await waitFor(() => expect(useTrainingStore.getState().configError).toBe('retry rejected'));
+        expect(useTrainingStore.getState().configErrorSource).toBe(source);
+        expect(api.initializeExperimentV2.mock.lastCall![0].document).toEqual(rejected.document);
+        expect(usePlaygroundStore.getState().access).toMatchObject({ prepared: { identities: INITIAL_PREPARED.identities } });
+
+        // Replies come from the worker's independently accepted recipe.
+        const restored = makeV2Result(1, 0, 2, 'restore', makeSnapshot(0), INITIAL_PREPARED, 1);
+        api.restoreCheckpointV2.mockResolvedValueOnce(restored);
+        await act(() => result.current.restoreCheckpoint(1));
+        expect(useTrainingStore.getState().latestEvaluation?.model).toEqual(restored.evidence.latestEvaluation!.model);
+        const reset = makeV2Result(2, 0, 1, 'initial', makeSnapshot(0), INITIAL_PREPARED);
+        api.resetExperimentV2.mockResolvedValueOnce(reset);
+        await act(() => result.current.reset());
+        expect(useTrainingStore.getState().latestEvaluation?.model).toEqual(reset.evidence.latestEvaluation!.model);
+        expect(useTrainingStore.getState().workerError).toBeNull();
+        expect(window.location.hash).toBe(encodeExperimentUrl(INITIAL_PREPARED.document));
+
+        act(() => useTrainingStore.getState().retryConfigSync());
+        await waitFor(() => expect(useTrainingStore.getState().evidenceGenerationId).toBe(3));
+        expect(useTrainingStore.getState().trainedRecipe).toEqual(candidate.recipe);
+        expect(window.location.hash).toBe(encodeExperimentUrl(candidate));
+    });
+
+    it('recovers the superseded worker commit when a later request rejects before its reply arrives', async () => {
+        renderHook(() => useTraining());
+        await waitFor(() => expect(useTrainingStore.getState().datasetStatus).toBe('ready'));
+        const api = bridge.workerApi.initializeExperimentV2;
+        const committed = deferred<ReturnType<typeof makeV2Result>>();
+        const rejected = deferred<ReturnType<typeof makeV2Result>>();
+        api.mockClear().mockImplementationOnce(() => committed.promise).mockImplementationOnce(() => rejected.promise);
+        await act(() => usePlaygroundStore.getState().editRecipe((recipe) => setHiddenLayers(recipe, [3])).then(() => {}));
+        await waitFor(() => expect(api).toHaveBeenCalledTimes(1));
+        const first = api.mock.calls[0][0] as WorkerExperimentRequestV2;
+        await act(() => usePlaygroundStore.getState().editRecipe((recipe) => setHiddenLayers(recipe, [7])).then(() => {}));
+        await waitFor(() => expect(api).toHaveBeenCalledTimes(2));
+        await act(async () => {
+            rejected.reject(new Error('second recipe rejected'));
+            committed.resolve(await makeV2ResultForRequest(2, first));
+        });
+        await waitFor(() => expect(useTrainingStore.getState()).toMatchObject({
+            configError: 'second recipe rejected', evidenceGenerationId: 2, datasetStatus: 'ready', runtimeSyncPending: false,
+        }));
+        expect(useTrainingStore.getState().trainedRecipe).toEqual(first.document.recipe);
+        expect(usePlaygroundStore.getState().access).toMatchObject({ prepared: { document: first.document } });
+        expect(decodeExperimentUrl(window.location.hash)).toEqual({ ok: true, value: first.document });
+    });
+
     it('forwards WebGPU grid toggles to the worker after initialization', async () => {
         renderHook(() => useTraining());
         await waitFor(() => expect(currentEvidenceStep()).toBe(0));
@@ -2034,7 +2110,7 @@ describe('useTraining', () => {
         await act(async () => resetPromise);
         await act(async () => result.current.restoreCheckpoint(1));
 
-        expect(bridge.workerApi.stepExperimentV2).toHaveBeenCalledWith(1);
+        expect(bridge.workerApi.stepExperimentV2).toHaveBeenCalledWith(1, 'current');
         expect(bridge.workerApi.resetExperimentV2).toHaveBeenCalledTimes(1);
         expect(bridge.workerApi.restoreCheckpointV2).toHaveBeenCalledTimes(1);
         expect(bridge.newRunTo).toHaveBeenCalledTimes(2);

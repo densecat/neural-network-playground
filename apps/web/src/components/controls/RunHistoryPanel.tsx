@@ -206,7 +206,7 @@ function RunHistoryContent({ saveController, saveFocusRequest, onTryVariation, v
             schemaVersion: 2,
             recipe: record.recipe,
             view: prepared.document.view,
-        });
+        }, 'saved-run');
         if (!result.ok) {
             setActionError(result.issues.map((entry) => entry.message).join(' '));
         }

@@ -32,6 +32,9 @@ export function CheckpointPanel({ training }: { training: TrainingHook }) {
     const branch = timeline.branch;
     const branchSource = timeline.checkpoints.find((point) => point.id === branch?.sourceCheckpointId);
     const previous = timeline.checkpoints.find((point) => point.id === branch?.previousCheckpointId);
+    const endpoint = timeline.checkpoints.find((point) => (
+        point.id === timeline.liveCheckpointId && point.step === branch?.targetStep
+    ));
 
     async function applyCheckpoint(nextAction: CheckpointAction, checkpointId: number) {
         const state = useTrainingStore.getState();
@@ -65,6 +68,9 @@ export function CheckpointPanel({ training }: { training: TrainingHook }) {
             <button type="button" disabled={busy || selected.id === previous.id} onClick={() => setId(previous.id)}>
                 Select previous live checkpoint
             </button>
+            {endpoint && <button type="button" disabled={busy || selected.id === endpoint.id} onClick={() => setId(endpoint.id)}>
+                Select branch endpoint
+            </button>}
         </>}
         <p>Training loss {selected.trainDataLoss.toFixed(4)} · test loss {selected.testDataLoss.toFixed(4)}</p>
         <p>{canBranch

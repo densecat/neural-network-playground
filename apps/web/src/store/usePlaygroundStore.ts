@@ -56,19 +56,25 @@ type PrepareExperiment = (
 export interface PlaygroundStoreInitialization {
     prepare?: PrepareExperiment;
     access: ExperimentAccessState;
+    runRequestSource?: RunRequestSource;
 }
+
+type RunRequestSource = 'document' | 'saved-run' | 'url';
 
 export interface PlaygroundStore {
     access: ExperimentAccessState;
     preparation: PreparationState;
     /** Changes when an explicit experiment replacement is published. */
     runRequestId: number;
+    runRequestSource: RunRequestSource;
     urlSyncNotice: string | null;
 
     featuresUI: FeaturesUI;
     demand: VisualizationDemand;
 
-    replaceDocument(value: unknown): Promise<SchemaResult<PreparedExperimentDocumentV2>>;
+    replaceDocument(value: unknown, source?: 'saved-run'): Promise<SchemaResult<PreparedExperimentDocumentV2>>;
+    acknowledgeRuntimeDocument(prepared: PreparedExperimentDocumentV2, publishAccess?: boolean): void;
+    restoreAcknowledgedDocument(prepared: PreparedExperimentDocumentV2): void;
     replaceImportedDocument(
         value: unknown,
         file: File,
@@ -153,6 +159,7 @@ export async function initializePlaygroundStateFromHash(
     return {
         prepare,
         access: { status: 'ready', prepared: prepared.value },
+        runRequestSource: rawHash ? 'url' : 'document',
     };
 }
 
@@ -189,6 +196,7 @@ export function createPlaygroundStore(
     let lastSuccessfulPrepared = initialAccess.status === 'ready'
         ? initialAccess.prepared
         : null;
+    let acknowledgedDocument: PreparedExperimentDocumentV2 | null = null;
 
     return create<PlaygroundStore>((set, get) => {
         const markIncompatible = (
@@ -197,6 +205,7 @@ export function createPlaygroundStore(
         ): void => {
             const requestId = ++nextRequestId;
             latestCandidateDocument = null;
+            acknowledgedDocument = null;
             const boundedIssues = issues.length > 0 ? issues : NO_ACTIVE_DOCUMENT;
             set({
                 access: {
@@ -213,6 +222,7 @@ export function createPlaygroundStore(
         const replace = async (
             value: unknown,
             failureSource: ExperimentInputSource | null = null,
+            source: RunRequestSource = 'document',
         ): Promise<SchemaResult<PreparedExperimentDocumentV2>> => {
             const requestId = ++nextRequestId;
             const startingViewRevision = viewRevision;
@@ -232,6 +242,7 @@ export function createPlaygroundStore(
             if (!result.ok) {
                 if (failureSource) {
                     latestCandidateDocument = null;
+                    acknowledgedDocument = null;
                     set({
                         access: {
                             status: 'incompatible',
@@ -267,6 +278,7 @@ export function createPlaygroundStore(
                 access: { status: 'ready', prepared },
                 preparation: { status: 'ready', requestId, issues: [] },
                 runRequestId: requestId,
+                runRequestSource: source,
             });
             return { ok: true, value: prepared };
         };
@@ -337,17 +349,38 @@ export function createPlaygroundStore(
             });
         };
 
+        const restoreAcknowledgedDocument = (prepared: PreparedExperimentDocumentV2): void => {
+            const { access, preparation } = get();
+            if (access.status !== 'ready') return;
+            // A display edit is independent of the worker's scientific recipe.
+            const current = access.prepared;
+            const restored = current.identities === prepared.identities ? current : {
+                ...prepared,
+                document: { ...prepared.document, view: current.document.view },
+            };
+            acknowledgedDocument = restored;
+            lastSuccessfulPrepared = restored;
+            if (preparation.status !== 'preparing') latestCandidateDocument = restored.document;
+            if (restored !== current) set({ access: { status: 'ready', prepared: restored } });
+        };
+
         return {
             access: initialAccess,
             preparation: initialAccess.status === 'ready'
                 ? { status: 'ready', requestId: 0, issues: [] }
                 : { status: 'error', requestId: 0, issues: [] },
             runRequestId: 0,
+            runRequestSource: initialization.runRequestSource ?? 'document',
             urlSyncNotice: null,
             featuresUI: { ...DEFAULT_FEATURES_UI },
             demand: { ...DEFAULT_DEMAND },
 
-            replaceDocument: (value) => replace(value),
+            replaceDocument: (value, source) => replace(value, null, source),
+            acknowledgeRuntimeDocument: (prepared, publishAccess = false) => {
+                acknowledgedDocument = prepared;
+                if (publishAccess) restoreAcknowledgedDocument(prepared);
+            },
+            restoreAcknowledgedDocument,
             replaceImportedDocument: (value, file) => replace(value, { kind: 'file', file }),
             markIncompatible,
             startFresh: async () => {
@@ -377,7 +410,10 @@ export function createPlaygroundStore(
                 const access = get().access;
                 if (access.status !== 'ready') return unavailableResult(access.issues);
                 try {
-                    const hash = encodeExperimentUrl(access.prepared.document);
+                    const displayed = access.prepared.document;
+                    const hash = encodeExperimentUrl(acknowledgedDocument
+                        ? { ...acknowledgedDocument.document, view: displayed.view }
+                        : displayed);
                     window.history.replaceState(null, '', hash);
                     if (get().urlSyncNotice !== null) set({ urlSyncNotice: null });
                     return { ok: true, value: hash };
@@ -394,7 +430,7 @@ export function createPlaygroundStore(
                     markIncompatible({ kind: 'url', rawHash: raw }, decoded.issues);
                     return decoded;
                 }
-                return replace(decoded.value, { kind: 'url', rawHash: raw });
+                return replace(decoded.value, { kind: 'url', rawHash: raw }, 'url');
             },
 
             setDemand: (demand) => set({ demand }),

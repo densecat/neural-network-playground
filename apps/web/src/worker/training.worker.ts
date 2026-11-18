@@ -1521,15 +1521,20 @@ async function runGpuGridIfDue(): Promise<void> {
 
 // ── Snapshot computation ──
 
+interface SnapshotOptions {
+    readonly lightweight?: boolean;
+    readonly evaluation?: PairedEvaluation;
+}
+
 /**
  * @param opts.lightweight — when true, skips the deep-copy of weights/biases
  * into the snapshot. The streaming path transfers flat buffers separately
  * (see packSnapshotMessage), so nested copies are pure waste there.
  */
-function computeSnapshotUnchecked(opts: { lightweight?: boolean } = {}): NetworkSnapshot {
+function computeSnapshotUnchecked(opts: SnapshotOptions): NetworkSnapshot {
     workerPerfMark('perf:worker:snapshot:start');
     const { network, runtime } = requireV2Runtime();
-    const evaluation = runtime.latestEvaluation;
+    const evaluation = opts.evaluation ?? runtime.latestEvaluation;
     if (evaluation === undefined) throw new Error('V2 snapshot requires a paired evaluation');
 
     const { demand } = state;
@@ -1727,7 +1732,7 @@ function computeSnapshotUnchecked(opts: { lightweight?: boolean } = {}): Network
     return snap;
 }
 
-function computeSnapshot(opts: { lightweight?: boolean } = {}): NetworkSnapshot {
+function computeSnapshot(opts: SnapshotOptions = {}): NetworkSnapshot {
     return withEngineNumericalBoundary('$.snapshot.engine', () => computeSnapshotUnchecked(opts));
 }
 
@@ -1764,6 +1769,7 @@ function isMulticlassConfusionMatrix(
 
 function directSnapshotArtifactBundle(
     snapshot: NetworkSnapshot,
+    evaluation = state.evaluationRuntime?.latestEvaluation,
 ): Pick<WorkerExperimentResultV2, 'artifacts' | 'layerStatsGradientRevision'> {
     requireV2Runtime();
     if (!state.datasetRevision) {
@@ -1804,7 +1810,6 @@ function directSnapshotArtifactBundle(
     }
     if (snapshot.testMetrics.confusionMatrix !== undefined
         || snapshot.testMetrics.multiclassConfusionMatrix !== undefined) {
-        const evaluation = state.evaluationRuntime?.latestEvaluation;
         if (evaluation === undefined) {
             throw new Error('direct confusion artifact requires a paired evaluation');
         }
@@ -2113,6 +2118,18 @@ function forceAndPublishEvaluationV2(
     return evaluation;
 }
 
+function prepareStoppedSnapshot(evaluation: PairedEvaluation, branchComplete: boolean): void {
+    const { generationId, revision } = evaluation.model;
+    if (branchComplete && !state.checkpoints.some(({ checkpoint }) => (
+        checkpoint.model.generationId === generationId && checkpoint.model.revision === revision
+    ))) {
+        appendV2Checkpoint({ ...evaluation, trigger: 'checkpoint' });
+    }
+    state.gridFreshFromGpu = false;
+    state.snapshotsSinceLastGrid = state.demand.gridInterval;
+    state.snapshotsSinceLastActivationHistogram = state.demand.activationHistogramInterval;
+}
+
 /**
  * Advances one strict V2 batch. Every live signal is retained in worker
  * history, while only cadence pairs are posted immediately. The current live
@@ -2294,6 +2311,7 @@ async function produceAndPostSnapshot(
             );
             return;
         }
+        if (branchComplete && currentEvaluation) prepareStoppedSnapshot(currentEvaluation, true);
     }
 
     const snap = computeSnapshot({ lightweight: true });
@@ -2330,8 +2348,6 @@ function trainTick(): void {
             const branchComplete = limitStepsToBranchBudget(1) === 0;
             if (branchComplete) {
                 stopInternalLoop();
-                state.snapshotsSinceLastGrid = state.demand.gridInterval;
-                state.snapshotsSinceLastActivationHistogram = state.demand.activationHistogramInterval;
             }
 
             // Back-pressure: skip snapshot computation + posting while the main
@@ -2668,8 +2684,11 @@ async function initializeExperimentV2Now(
     }
 }
 
-function stepExperimentV2Now(iterations: number): WorkerExperimentResultV2 {
+function stepExperimentV2Now(iterations: number, visuals: 'cadence' | 'current'): WorkerExperimentResultV2 {
     try {
+        if (visuals !== 'cadence' && visuals !== 'current') {
+            throw new RangeError('Manual step visuals must be cadence or current.');
+        }
         if (!Number.isSafeInteger(iterations)
             || iterations < 1
             || iterations > MAX_MANUAL_V2_STEP_ITERATIONS) {
@@ -2684,10 +2703,12 @@ function stepExperimentV2Now(iterations: number): WorkerExperimentResultV2 {
             latestLive = trainOneStepV2()?.liveSignal ?? latestLive;
         }
         const evaluation = forceAndPublishEvaluationV2('manual-step', false);
+        const branchComplete = limitStepsToBranchBudget(1) === 0;
+        if (branchComplete || visuals === 'current') prepareStoppedSnapshot(evaluation, branchComplete);
         const evidence = makeEvidenceV2(latestLive, evaluation);
         postEvidenceV2(evidence);
         const snapshot = computeSnapshot();
-        if (limitStepsToBranchBudget(1) === 0) {
+        if (branchComplete) {
             stopInternalLoop();
             postStatus('paused', 'max-steps');
         }
@@ -2885,29 +2906,14 @@ function prepareRestoreCandidate(
     replacementHistory.appendEvaluation(preparedEvaluation.evaluation);
     const checkpointTimeline = buildCheckpointTimeline(ring);
 
-    // A temporary runtime lets computeSnapshot exercise the exact demanded
-    // artifact path without touching the active EvaluationRuntime.
-    const previewRuntime = createEvaluationRuntimeForNetwork({
-        generationId: state.runId,
-        objectiveKey: prepared.identities.objectiveKey,
-        dataset: datasetRevision,
-        compiled,
-        getNetwork: () => candidate,
-        trainInputs: state.trainInputs,
-        trainTargets: state.trainTargets,
-        testInputs: state.testInputs,
-        testTargets: state.testTargets,
-        getCurrentModel: readCandidateModel,
-    });
-    previewRuntime.forceEvaluation('checkpoint');
-
+    // Build the detached snapshot using the exact candidate evidence validated
+    // above. The live EvaluationRuntime changes only when the restore commits.
     const previousState: WorkerState = { ...state };
     let snapshot: NetworkSnapshot;
     let artifacts: ReturnType<typeof directSnapshotArtifactBundle>;
     let nextState: WorkerState;
     try {
         state.network = candidate;
-        state.evaluationRuntime = previewRuntime;
         state.metricHistory = replacementHistory;
         state.v2EpochRef = { value: checkpoint.cursor.epoch };
         state.v2NetworkRef = { value: candidate };
@@ -2922,8 +2928,8 @@ function prepareRestoreCandidate(
         state.gpuPredictor = null;
         state.sharedViews = null;
         resetRestoreDerivedState(candidate);
-        snapshot = computeSnapshot();
-        artifacts = directSnapshotArtifactBundle(snapshot);
+        snapshot = computeSnapshot({ evaluation: preparedEvaluation.evaluation });
+        artifacts = directSnapshotArtifactBundle(snapshot, preparedEvaluation.evaluation);
         nextState = {
             ...state,
             ...ring,
@@ -3069,9 +3075,9 @@ export const workerApi = {
         return enqueueV2Mutation(() => initializeExperimentV2Now(request));
     },
 
-    /** Manual stepping always finishes with a current same-revision pair. */
-    stepExperimentV2(iterations: number = 1): Promise<WorkerExperimentResultV2> {
-        return enqueueV2Mutation(() => stepExperimentV2Now(iterations));
+    /** Interactive Step refreshes the visible plots alongside its full evaluation. */
+    stepExperimentV2(iterations = 1, visuals: 'cadence' | 'current' = 'cadence'): Promise<WorkerExperimentResultV2> {
+        return enqueueV2Mutation(() => stepExperimentV2Now(iterations, visuals));
     },
 
     /** Rebuild the exact current prepared document as a fresh generation. */

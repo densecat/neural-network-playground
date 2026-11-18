@@ -441,7 +441,7 @@ describe('RunHistoryPanel V2 evidence memory', () => {
             kind: 'nn-playground-experiment',
             schemaVersion: 2,
             recipe: prepared.document.recipe,
-        })));
+        }), 'saved-run'));
         expect(screen.queryByRole('button', { name: /restore/i })).not.toBeInTheDocument();
     });
 

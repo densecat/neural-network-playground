@@ -16,6 +16,7 @@ import type {
 import {
     canonicalizeJson,
     parseWorkerEvidenceMessageV2,
+    type PreparedExperimentDocumentV2,
     type ValidatedStandardExperimentRecipeV2,
 } from '@nn-playground/shared';
 import {
@@ -25,10 +26,17 @@ import {
 } from './metricHistoryBuffer.ts';
 import { normalizeTrainingSpeed } from '../worker/trainingLoop.ts';
 import type { FrameVersions } from '../worker/frameBuffer.ts';
+import type { PlaygroundStore } from './usePlaygroundStore.ts';
 
-export type ConfigChangeSource = 'data' | 'network' | 'features' | 'training' | 'preset' | 'setup' | null;
+export type ConfigChangeSource = 'data' | 'network' | 'features' | 'training' | 'preset' | 'setup' | 'saved-run' | 'url' | null;
 export type TrainedRecipeSource = 'initialize' | 'config-sync' | 'reset' | 'restore';
 export type DatasetStatus = 'loading' | 'ready' | 'error';
+
+export interface RejectedConfigRequest {
+    readonly runRequestId: number;
+    readonly runRequestSource: PlaygroundStore['runRequestSource'];
+    readonly prepared: PreparedExperimentDocumentV2;
+}
 
 export interface PreparedTrainingEvidenceReplacement {
     readonly evidence: WorkerEvidenceMessageV2;
@@ -83,6 +91,7 @@ export interface TrainingStore {
     runtimeSyncPending: boolean;
     configError: string | null;
     configErrorSource: ConfigChangeSource;
+    rejectedConfigRequest: RejectedConfigRequest | null;
     configSyncNonce: number;
     workerError: string | null;
     pauseReason: PauseReason | null;
@@ -119,7 +128,7 @@ export interface TrainingStore {
     setStepsPerFrame: (n: number) => void;
     beginConfigChange: (source: Exclude<ConfigChangeSource, null>) => void;
     finishConfigChange: () => void;
-    failConfigChange: (message: string) => void;
+    failConfigChange: (message: string, rejectedRequest?: RejectedConfigRequest) => void;
     retryConfigSync: () => void;
     setWorkerError: (message: string) => void;
     clearWorkerError: () => void;
@@ -185,6 +194,7 @@ export const useTrainingStore = create<TrainingStore>((set, get) => ({
     runtimeSyncPending: false,
     configError: null,
     configErrorSource: null,
+    rejectedConfigRequest: null,
     configSyncNonce: 0,
     workerError: null,
     pauseReason: null,
@@ -339,6 +349,7 @@ export const useTrainingStore = create<TrainingStore>((set, get) => ({
         presetConfigLoading: source === 'preset',
         configError: null,
         configErrorSource: null,
+        rejectedConfigRequest: null,
         workerError: null,
     }),
     finishConfigChange: () => set({
@@ -348,8 +359,9 @@ export const useTrainingStore = create<TrainingStore>((set, get) => ({
         featuresConfigLoading: false,
         trainingConfigLoading: false,
         presetConfigLoading: false,
+        rejectedConfigRequest: null,
     }),
-    failConfigChange: (message) => set((state) => ({
+    failConfigChange: (message, rejectedRequest) => set((state) => ({
         pendingConfigSource: null,
         dataConfigLoading: false,
         networkConfigLoading: false,
@@ -358,6 +370,7 @@ export const useTrainingStore = create<TrainingStore>((set, get) => ({
         presetConfigLoading: false,
         configError: message,
         configErrorSource: state.pendingConfigSource,
+        rejectedConfigRequest: rejectedRequest ?? null,
     })),
     retryConfigSync: () => set((state) => {
         if (!state.configErrorSource) {

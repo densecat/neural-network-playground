@@ -851,7 +851,7 @@ describe('training worker scientific-trust V2 boundary', () => {
         replaceV2CheckpointForTests(baselineId, baseline);
         const evaluateObjective = Network.prototype.evaluateObjective;
         const evaluatedNetworks = new Set<Network>();
-        vi.spyOn(Network.prototype, 'evaluateObjective').mockImplementation(function (
+        const evaluateTrain = vi.spyOn(Network.prototype, 'evaluateObjective').mockImplementation(function (
             this: Network,
             ...args: Parameters<Network['evaluateObjective']>
         ) {
@@ -868,6 +868,7 @@ describe('training worker scientific-trust V2 boundary', () => {
             checkpointId: baselineId,
         });
         expect(evaluatedNetworks.size).toBe(1);
+        expect(evaluateTrain).toHaveBeenCalledTimes(1);
         expect(restored.evidence.latestEvaluation?.trigger).toBe('restore');
         expect(restored.checkpointTimeline.restoredCheckpointId).toBe(baselineId);
 
@@ -1144,6 +1145,73 @@ describe('training worker scientific-trust V2 boundary', () => {
         expect(workerApi.getMetricHistoryV2().trendHistory.slice(0, 3).map((point) => point.dataLoss)).toEqual(firstTrend);
         expect((await workerApi.stepExperimentV2(10)).snapshot.step).toBe(7);
         expect(getV2CheckpointForTests(originalId).model.step).toBe(1);
+    });
+
+    it.each([3, 50])('publishes matching Play and Step evidence and retains one branch endpoint at step %i', async (targetStep) => {
+        vi.useFakeTimers();
+        vi.stubGlobal('crossOriginIsolated', false);
+        const fixtures = await createScientificTrustFixtures();
+        const branchRequest = () => ({
+            type: 'branch-checkpoint', protocolVersion: WORKER_PROTOCOL_VERSION,
+            requestId: nextRequestId++, checkpointId: 1, trainingSteps: targetStep,
+        });
+        const start = async () => {
+            await workerApi.initializeExperimentV2(withFreshId(fixtures.request));
+            workerApi.updateDemand({
+                ...DEFAULT_DEMAND,
+                needActivationHistograms: true,
+                gridInterval: 20,
+                activationHistogramInterval: 20,
+            });
+            await workerApi.stepExperimentV2(1);
+            return workerApi.branchCheckpointV2(branchRequest());
+        };
+
+        const capture = createCapturingPort();
+        workerApi.setStreamPort(capture.port);
+        await start();
+        const firstPlayMessage = capture.messages.length;
+        capture.dispatch({ type: 'startTraining', stepsPerFrame: 1 });
+        await flushMicrotasks();
+        await vi.advanceTimersByTimeAsync(1000);
+        const playMessages = capture.messages.slice(firstPlayMessage);
+        const finalFrame = snapshotMessages(playMessages).at(-1)!;
+        const playEvaluation = evidenceMessages(playMessages).flatMap((message) => (
+            message.latestEvaluation ? [message.latestEvaluation] : []
+        )).at(-1)!;
+        expect(finalFrame.model.step).toBe(targetStep);
+        expect(playEvaluation.model).toEqual(finalFrame.model);
+        expect(finalFrame.checkpointTimeline.checkpoints.filter((point) => point.step === targetStep)).toHaveLength(1);
+
+        const branched = await start();
+        // Consume one direct snapshot before finishing so artifact cadence
+        // would skip the final model without the endpoint refresh.
+        for (let remaining = targetStep - 1; remaining > 0; remaining -= 10) {
+            await workerApi.stepExperimentV2(Math.min(10, remaining));
+        }
+        const stepped = await workerApi.stepExperimentV2(1);
+        expect(stepped.snapshot.step).toBe(targetStep);
+        expect(stepped.snapshot.outputGrid).toHaveLength(stepped.snapshot.gridSize ** 2);
+        expect(stepped.snapshot.outputGrid).toEqual(finalFrame.outputGrid);
+        expect(stepped.snapshot.neuronGrids).toEqual(finalFrame.neuronGrids);
+        expect(stepped.snapshot.activationHistograms?.bins).toEqual(finalFrame.activationHistogramBins);
+        expect(stepped.evidence.latestEvaluation?.train).toEqual(playEvaluation.train);
+        expect(stepped.evidence.latestEvaluation?.test).toEqual(playEvaluation.test);
+        expect(stepped.evidence.latestEvaluation?.objective).toEqual(playEvaluation.objective);
+        expect(finalFrame.artifacts?.activationHistogram?.model).toEqual(finalFrame.model);
+        expect(stepped.artifacts?.activationHistogram?.model).toEqual(stepped.evidence.latestEvaluation?.model);
+        const endpoints = stepped.checkpointTimeline.checkpoints.filter((point) => point.step === targetStep);
+        expect(endpoints).toHaveLength(1);
+        const endpointId = endpoints[0]!.id;
+        expect(stepped.checkpointTimeline.liveCheckpointId).toBe(endpointId);
+
+        const restored = await workerApi.restoreCheckpointV2({
+            type: 'restore-checkpoint', protocolVersion: WORKER_PROTOCOL_VERSION,
+            requestId: nextRequestId++, checkpointId: branched.checkpointTimeline.branch!.previousCheckpointId,
+        });
+        expect(restored.snapshot.step).toBe(1);
+        expect(restored.checkpointTimeline.checkpoints).toContainEqual(endpoints[0]);
+        expect(getV2CheckpointForTests(endpointId).model.step).toBe(targetStep);
     });
 
     it.each(['recipe', 'datasetKey', 'objectiveKey'] as const)(

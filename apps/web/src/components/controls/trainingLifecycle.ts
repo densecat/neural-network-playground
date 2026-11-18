@@ -16,6 +16,8 @@ const CONFIG_SOURCE_LABELS: Record<Exclude<ConfigChangeSource, null>, string> = 
     training: 'training',
     preset: 'preset',
     setup: 'setup',
+    'saved-run': 'saved run',
+    url: 'shared setup',
 };
 
 function formatPauseReason(reason: PauseReason): string {

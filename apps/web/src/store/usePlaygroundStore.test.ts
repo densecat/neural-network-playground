@@ -362,6 +362,24 @@ describe('atomic prepared-document store', () => {
         expect(store.getState().runRequestId).toBe(1);
     });
 
+    it('shares the acknowledged recipe during worker preparation and bases new edits on it after rollback', async () => {
+        const initial = preset('xor-hidden').prepared;
+        const store = createReadyStore(initial);
+        const page = store.getState();
+        page.acknowledgeRuntimeDocument(initial);
+        await page.replaceDocument(withNoise(initial, 17), 'saved-run');
+        const requestId = store.getState().runRequestId;
+        await page.editView((view) => ({ ...view, showTestData: !view.showTestData }));
+        const view = readyPrepared(store).document.view;
+        expect(window.location.hash).toBe(encodeExperimentUrl({ ...initial.document, view }));
+        page.restoreAcknowledgedDocument(initial);
+        expect(readyPrepared(store).document).toEqual({ ...initial.document, view });
+        expect(store.getState()).toMatchObject({ runRequestId: requestId, runRequestSource: 'saved-run' });
+        await page.editRecipe((recipe) => setLearningRate(recipe, 0.12));
+        expect(readyPrepared(store).document.recipe.data.noise).toBe(initial.document.recipe.data.noise);
+        expect(readyPrepared(store).document.view).toEqual(view);
+    });
+
     it('rejects a fabricated catalog entry whose recipe/prepared pair does not match', async () => {
         const store = createReadyStore();
         const target = preset('regression-plane');

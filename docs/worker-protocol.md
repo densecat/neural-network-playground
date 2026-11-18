@@ -50,7 +50,8 @@ through the MessageChannel commands below.
 |---|---|---|
 | `initialize(network, training, data, features)` | `{ snapshot, runId }` | Normalizes and validates config, rebuilds data/network, allocates fresh transport state. |
 | `updateConfig(network, training, data, features, rebuild)` | `{ snapshot, runId }` | Normalizes and validates config; rebuilds only when required or requested. |
-| `step(iterations = 1)` | `NetworkSnapshot` | Synchronous manual stepping for UI "step" actions/tests. |
+| `step(iterations = 1)` | `NetworkSnapshot` | Legacy synchronous stepping. |
+| `stepExperimentV2(iterations = 1, visuals = 'cadence')` | `Promise<WorkerExperimentResultV2>` | The Step button requests `'current'` to publish visible plots for the same model as the full evaluation. Other callers can use the configured plot cadence. |
 | `reset()` | `{ snapshot, runId }` | Stops streaming, rebuilds data/network, returns a fresh snapshot. |
 | `captureCheckpointV2(request)` | `WorkerExperimentResultV2` | Captures the current model and paired evaluation in the worker and returns lightweight timeline metadata. |
 | `restoreCheckpointV2(request)` | `WorkerExperimentResultV2` | Stops streaming and applies a checkpoint in the current generation. |
@@ -251,8 +252,10 @@ The metadata also includes `maxCheckpoints`, `evictedCount`,
 `liveCheckpointId`, and `restoredCheckpointId`. An active `branch` references
 the source and previous live checkpoints and can include a `targetStep`.
 The worker retains both referenced checkpoints within the bounded timeline
-while the branch is active. Checkpoint payloads stay inside the worker for the
-duration of the session.
+while the branch is active. At the target step, both Play and Step publish
+the final evaluation and requested plots and retain one endpoint checkpoint.
+Restoring the previous model leaves that endpoint available in the timeline.
+Checkpoint payloads stay inside the worker for the duration of the session.
 
 Checkpoint schema version 3 saves the shuffled indices, next batch offset,
 and shuffle generator state alongside the model parameters and optimizer.

@@ -90,14 +90,17 @@ export const ConfigPanel = memo(function ConfigPanel(_props: ConfigPanelProps) {
             if (!expected) return;
             const ps = usePlaygroundStore.getState();
             const ts = useTrainingStore.getState();
+            const activeMatches = ps.access.status === 'ready' && ps.access.prepared.identities === expected.identities;
+            const rejectedMatches = ts.rejectedConfigRequest?.runRequestId === expected.requestId
+                && ts.rejectedConfigRequest.prepared.identities === expected.identities;
             if (ps.access.status !== 'ready' || ps.runRequestId !== expected.requestId
-                || ps.access.prepared.identities !== expected.identities || ps.preparation.status === 'preparing') {
+                || (!activeMatches && !rejectedMatches) || ps.preparation.status === 'preparing') {
                 target.current = null;
                 finishImport();
                 reportError('The active setup changed during import. Select the file again to review it.');
             } else if (ts.configError || ts.workerError) {
                 reportError(`${ts.configError ?? ts.workerError}. Retry synchronization to finish applying this setup.`);
-            } else if (ts.pendingConfigSource === null && ts.trainedRecipeSource === 'config-sync'
+            } else if (activeMatches && ts.pendingConfigSource === null && ts.trainedRecipeSource === 'config-sync'
                 && ts.trainedRecipeFingerprint === expected.identities.recipeFingerprint) {
                 target.current = null;
                 setStage(null);
