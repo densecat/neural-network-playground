@@ -1,7 +1,7 @@
 // ── Shared constants ──
 import type { FeatureFlags, NetworkConfig, TrainingConfig, DataConfig } from '@nn-playground/engine';
 import { validateExperimentDocument } from './experimentSchema.js';
-import type { ExperimentDocumentV2 } from './types.js';
+import type { ExperimentDocumentV2, StandardExperimentRecipeV2 } from './types.js';
 
 export const DEFAULT_SEED = 42;
 export const DEFAULT_NUM_SAMPLES = 300;
@@ -114,3 +114,22 @@ if (!defaultExperimentValidation.ok) {
 }
 
 export const DEFAULT_EXPERIMENT_DOCUMENT = defaultExperimentValidation.value;
+
+export const FIRST_RUN_EXERCISE_RECIPE = {
+    data: { sampleCount: 80, trainFraction: 0.5, noise: 0, seed: 42 },
+    inputs: { featureIds: ['x', 'y'] },
+    model: { hiddenLayers: [], hiddenActivation: 'tanh', initialization: 'zeros', seed: 42 },
+    training: {
+        batchSize: 40,
+        learningRate: 3,
+        schedule: { kind: 'constant' },
+        optimizer: { kind: 'sgd' },
+        gradientClipping: { kind: 'none' },
+    },
+    task: { kind: 'binary-classification', dataset: 'gauss' },
+    objective: {
+        dataLoss: { kind: 'binary-cross-entropy-with-logits' },
+        penalty: { kind: 'none' },
+        reduction: 'mean-per-sample',
+    },
+} as const satisfies StandardExperimentRecipeV2;

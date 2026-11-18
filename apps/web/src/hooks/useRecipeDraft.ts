@@ -1,11 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { canonicalizeJson, validateExperimentDocument, type ExperimentRunRecordV2, type PreparedExperimentDocumentV2, type StandardExperimentRecipeV2 } from '@nn-playground/shared';
+import { canonicalizeJson, FIRST_RUN_EXERCISE_RECIPE, structuralEqual, validateExperimentDocument, type ExperimentRunRecordV2, type PreparedExperimentDocumentV2, type StandardExperimentRecipeV2 } from '@nn-playground/shared';
 import { getDatasetContract, type DatasetId } from '@nn-playground/engine';
 import { usePlaygroundStore } from '../store/usePlaygroundStore.ts';
 import { useTrainingStore } from '../store/useTrainingStore.ts';
 import { commitRecipeEditPrepared } from '../store/commitRecipeEdit.ts';
 
 export type SetupTab = 'dataset' | 'network' | 'training';
+export const FIRST_RUN_EXERCISE = {
+    title: 'Train a single neuron',
+    instructions: 'Open Results → Prediction and press Step three times. Watch the flat prediction field form blue and orange regions as the neuron learns to separate two clusters.',
+};
+
 type Draft = {
     base: PreparedExperimentDocumentV2;
     baseRunRequestId: number;
@@ -22,6 +27,7 @@ export interface RecipeDraftController {
     recipe: StandardExperimentRecipeV2 | null;
     dirty: boolean; valid: boolean; canApply: boolean; busy: boolean; submitted: boolean; error: string | null;
     issues: readonly string[];
+    isFirstExercise: boolean;
     variationBaseline: ExperimentRunRecordV2 | null;
     appliedVariation: AppliedVariation | null;
     value(path: string): unknown;
@@ -30,6 +36,7 @@ export interface RecipeDraftController {
         number(path: string, text: string): void;
         dataset(dataset: DatasetId): void;
         preset(recipe: StandardExperimentRecipeV2): void;
+        firstExercise(): boolean;
         variation(record: ExperimentRunRecordV2): boolean;
         apply(): Promise<boolean>;
         cancel(): void;
@@ -86,14 +93,17 @@ export function useRecipeDraft(): RecipeDraftController {
     const valid = validation?.ok === true;
     const busy = submitted || pending !== null;
     const canApply = !busy && validation?.ok === true && canApplyCandidate(draft, validation.value.recipe);
+    const isFirstExercise = valid && !draft?.baseline && structuralEqual(recipe, FIRST_RUN_EXERCISE_RECIPE);
 
     const checkTarget = useCallback(() => {
         const request = target.current;
         if (!request) return;
         const ts = useTrainingStore.getState();
         const ps = usePlaygroundStore.getState();
-        if (ps.runRequestId !== request.runRequestId || ps.access.status !== 'ready'
-            || ps.access.prepared.identities !== request.prepared.identities) {
+        const activeMatches = ps.access.status === 'ready' && ps.access.prepared.identities === request.prepared.identities;
+        const rejectedMatches = ts.rejectedConfigRequest?.runRequestId === request.runRequestId
+            && ts.rejectedConfigRequest.prepared.identities === request.prepared.identities;
+        if (ps.runRequestId !== request.runRequestId || (!activeMatches && !rejectedMatches)) {
             target.current = null; lock.current = false; setSubmitted(false);
             setError('The active experiment changed while setup was applying. Discard this draft to reload it.');
             resolve.current?.(false); resolve.current = null;
@@ -107,7 +117,7 @@ export function useRecipeDraft(): RecipeDraftController {
         const recipeFingerprint = request.prepared.identities.recipeFingerprint;
         const generationId = ts.evidenceGenerationId;
         const newGeneration = generationId !== null && generationId > (request.previousGeneration ?? 0);
-        if (ts.pendingConfigSource === null && ts.trainedRecipeFingerprint === recipeFingerprint
+        if (activeMatches && ts.pendingConfigSource === null && ts.trainedRecipeFingerprint === recipeFingerprint
             && ts.trainedRecipeSource === 'config-sync' && (!request.baselineId || newGeneration)) {
             target.current = null; lock.current = false;
             setAppliedVariation(request.baselineId && generationId !== null
@@ -138,23 +148,31 @@ export function useRecipeDraft(): RecipeDraftController {
         if (text !== undefined) next.text[path] = text;
         replaceDraft(next); setError(null);
     };
+    const stagePreset = (recipe: StandardExperimentRecipeV2): boolean => {
+        const state = usePlaygroundStore.getState();
+        if (lock.current || useTrainingStore.getState().pendingConfigSource !== null || state.access.status !== 'ready') return false;
+        const current = draftRef.current;
+        replaceDraft({
+            base: current?.base ?? state.access.prepared,
+            baseRunRequestId: current?.baseRunRequestId ?? state.runRequestId,
+            recipe: clone(recipe),
+            text: {},
+            baseline: current?.baseline,
+        });
+        setError(null);
+        return true;
+    };
     return {
         recipe, dirty, valid, canApply, busy, submitted, error: error ?? configError, issues,
-        variationBaseline: draft?.baseline ?? null, appliedVariation,
+        isFirstExercise, variationBaseline: draft?.baseline ?? null, appliedVariation,
         value: (path) => draft?.text[path] ?? read(recipe, path),
         commands: {
             set: edit,
-            preset: (recipe) => {
-                if (lock.current || pending !== null || !prepared) return;
-                const next: Draft = {
-                    base: draftRef.current?.base ?? prepared,
-                    baseRunRequestId: draftRef.current?.baseRunRequestId ?? usePlaygroundStore.getState().runRequestId,
-                    recipe: clone(recipe),
-                    text: {},
-                    baseline: draftRef.current?.baseline,
-                };
-                replaceDraft(next);
-                setError(null);
+            preset: stagePreset,
+            firstExercise: () => {
+                const state = usePlaygroundStore.getState();
+                if (isDirty(draftRef.current) || state.preparation.status === 'preparing') return false;
+                return stagePreset(FIRST_RUN_EXERCISE_RECIPE);
             },
             variation: (record) => {
                 const state = usePlaygroundStore.getState();

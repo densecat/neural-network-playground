@@ -67,10 +67,15 @@ and Inspect for paused diagnostics. Saved runs and Lessons are separate header
 destinations. The utility menu contains exports/imports, checkpoints, guidance,
 and help. Switching views or themes preserves the active training run.
 
+For a first experiment, choose **Train a single neuron** in Getting started.
+Apply the seeded setup, open **Results → Prediction**, and press **Step** three
+times to see the initially uniform prediction field separate into two colors.
+
 To compare training durations from the same model, pause training, open
 **Checkpoints**, choose a checkpoint and enter an optimizer-step budget.
-**Branch from checkpoint** keeps the previous live model in the timeline. Press
-**Play** to train up to the selected limit. New checkpoints restore the shuffle
+**Branch from checkpoint** keeps the previous live model in the timeline. Use
+**Play** or **Step** to reach the limit. The endpoint is saved automatically,
+so you can restore either model for comparison. New checkpoints restore the shuffle
 state as well as the parameters and optimizer. The evaluation history and
 automatic-stop tracking start fresh on each branch.
 

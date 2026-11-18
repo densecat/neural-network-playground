@@ -5,7 +5,7 @@ import { NetworkGraph } from '../visualization/NetworkGraph.tsx';
 import { NetworkSelectionDeck } from '../visualization/NetworkSelectionDeck.tsx';
 import type { NetworkSelectionController } from '../visualization/useNetworkSelectionController.ts';
 import type { SetupTab } from '../../productShell/atelierTypes.ts';
-import { Icon, Tabs } from './ui.tsx';
+import { Icon, tabPanelProps, Tabs } from './ui.tsx';
 import { getDatasetContract } from '@nn-playground/engine';
 import { useThemeStore, readPlotPalette } from '../../store/theme.ts';
 import { CLASS_COLORS, fieldColor, hexRgb } from '../visualization/plotColors.ts';
@@ -37,6 +37,9 @@ const DataPlot = memo(function DataPlot() {
 });
 
 export type NetworkRegion = 'data' | 'network' | 'prediction';
+const NETWORK_REGIONS = [{ id: 'network', label: 'Network' }, { id: 'data', label: 'Data' }, { id: 'prediction', label: 'Prediction' }] as const;
+const NETWORK_PANEL_PREFIX = 'network-region';
+
 export interface AtelierNetworkProps {
     layout: 'compact' | 'stacked' | 'wide';
     region: NetworkRegion;
@@ -52,23 +55,26 @@ export function AtelierNetwork({ layout, region, onRegionChange, prediction, gra
     const showData = !compact || region === 'data';
     const showNetwork = !compact || region === 'network';
     const showPrediction = !compact || region === 'prediction';
-    const dataPanel = <section key="data" className="atelier-network-data" hidden={!showData}>
+    const panelProps = (id: NetworkRegion) => compact ? { ...tabPanelProps(NETWORK_PANEL_PREFIX, id), tabIndex: 0 } : undefined;
+    const selectionDetail = graph.model.kind === 'selected' && <div className="atelier-neuron-detail"><NetworkSelectionDeck model={graph.model} onClear={graph.commands.clearSelection} /></div>;
+    const dataPanel = <section key="data" {...panelProps('data')} className="atelier-network-data" hidden={!showData}>
         <div className="atelier-section-title"><h2>Data</h2><button type="button" onClick={() => onSetup('dataset')} aria-label="Edit dataset"><Icon name="settings" /></button></div>
         {showData && <DataPlot />}
     </section>;
-    const networkPanel = <section key="network" className="atelier-network-model" hidden={!showNetwork}>
+    const networkPanel = <section key="network" {...panelProps('network')} className="atelier-network-model" hidden={!showNetwork}>
         <div className="atelier-section-title"><h2>Network</h2><button type="button" onClick={() => onSetup('network')}>Edit layers <Icon name="next" size={14} /></button></div>
         <div className="atelier-network-graph">{showNetwork && <NetworkGraph selectionController={graph} />}</div>
+        {compact && showNetwork && selectionDetail}
     </section>;
     return <>
-        {compact && <Tabs label="Network regions" items={[{id:'network',label:'Network'},{id:'data',label:'Data'},{id:'prediction',label:'Prediction'}]} value={region} onChange={onRegionChange} />}
+        {compact && <Tabs panelPrefix={NETWORK_PANEL_PREFIX} label="Network regions" items={NETWORK_REGIONS} value={region} onChange={onRegionChange} />}
         <div className="atelier-network" data-layout={layout}>
             {layout === 'wide' ? [dataPanel, networkPanel] : [networkPanel, dataPanel]}
-            <section className="atelier-network-prediction" hidden={!showPrediction}>
+            <section {...panelProps('prediction')} className="atelier-network-prediction" hidden={!showPrediction}>
                 <div className="atelier-section-title"><h2>Prediction</h2><button type="button" onClick={onResults} aria-label="Expand prediction results"><Icon name="expand" /></button></div>
                 {showPrediction && prediction}
             </section>
         </div>
-        {graph.model.kind === 'selected' && <div className="atelier-neuron-detail"><NetworkSelectionDeck model={graph.model} onClear={graph.commands.clearSelection} /></div>}
+        {!compact && selectionDetail}
     </>;
 }

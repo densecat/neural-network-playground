@@ -1,6 +1,6 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { DEFAULT_EXPERIMENT_DOCUMENT, PREPARED_PRESETS } from '@nn-playground/shared';
+import { DEFAULT_EXPERIMENT_DOCUMENT, FIRST_RUN_EXERCISE_RECIPE, PREPARED_PRESETS } from '@nn-playground/shared';
 import { useRecipeDraft } from './useRecipeDraft.ts';
 import { usePlaygroundStore } from '../store/usePlaygroundStore.ts';
 import { useTrainingStore } from '../store/useTrainingStore.ts';
@@ -155,14 +155,33 @@ describe('session recipe draft', () => {
         await act(async () => {expect(await result.current.commands.apply()).toBe(false);});
         expect(result.current.value('data.noise')).toBe('12');expect(result.current.busy).toBe(false);expect(result.current.error).toContain('Preparation failed');
     });
-    it('retains submitted state through a sync failure and existing retry', async () => {
-        const {result}=renderHook(useRecipeDraft);act(() => result.current.commands.number('data.noise','12'));
-        let apply!:Promise<boolean>;act(() => {apply=result.current.commands.apply();});
+    it('retains the submitted draft while a sync failure rolls back and retries the exact candidate', async () => {
+        const original = prepared();
+        const { result } = renderHook(useRecipeDraft);
+        act(() => result.current.commands.number('data.noise', '12'));
+        let apply!: Promise<boolean>;
+        act(() => { apply = result.current.commands.apply(); });
         await waitFor(() => expect(prepared().document.recipe.data.noise).toBe(12));
-        act(() => useTrainingStore.getState().failConfigChange('Worker unavailable'));
-        expect(await apply).toBe(false);expect(result.current.submitted).toBe(true);expect(result.current.dirty).toBe(true);
-        act(() => result.current.commands.retry());expect(useTrainingStore.getState().pendingConfigSource).toBe('setup');
-        await acknowledge();await waitFor(() => expect(result.current.dirty).toBe(false));
+        const rejected = prepared();
+        const { runRequestId, runRequestSource } = usePlaygroundStore.getState();
+        act(() => {
+            useTrainingStore.getState().failConfigChange('Worker unavailable', {
+                runRequestId, runRequestSource, prepared: rejected,
+            });
+            usePlaygroundStore.setState({ access: { status: 'ready', prepared: original } });
+        });
+        expect(await apply).toBe(false);
+        expect(result.current.submitted).toBe(true);
+        expect(result.current.dirty).toBe(true);
+        expect(result.current.value('data.noise')).toBe('12');
+
+        act(() => result.current.commands.retry());
+        expect(useTrainingStore.getState().pendingConfigSource).toBe('setup');
+        expect(result.current.submitted).toBe(true);
+        act(() => usePlaygroundStore.setState({ access: { status: 'ready', prepared: rejected } }));
+        await acknowledge();
+        await waitFor(() => expect(result.current.dirty).toBe(false));
+        expect(result.current.error).toBeNull();
     });
 });
 
@@ -220,4 +239,49 @@ it('preset replacement retains the original draft base when another recipe wins'
     await act(async () => { expect(await result.current.commands.apply()).toBe(false); });
     expect(result.current.error).toContain('active recipe changed');
     expect(prepared().document.recipe.model.seed).toBe(123);
+});
+
+it('stages the first exercise without changing the default recipe and applies it through worker acknowledgement', async () => {
+    const original = prepared();
+    const { result } = renderHook(useRecipeDraft);
+    expect(result.current.isFirstExercise).toBe(false);
+
+    act(() => expect(result.current.commands.firstExercise()).toBe(true));
+    expect(prepared()).toBe(original);
+    expect(result.current.recipe).toEqual(FIRST_RUN_EXERCISE_RECIPE);
+    expect(result.current.isFirstExercise).toBe(true);
+    expect(result.current.canApply).toBe(true);
+
+    act(() => result.current.commands.cancel());
+    expect(result.current.recipe).toEqual(DEFAULT_EXPERIMENT_DOCUMENT.recipe);
+    expect(result.current.isFirstExercise).toBe(false);
+
+    let apply!: Promise<boolean>;
+    act(() => {
+        expect(result.current.commands.firstExercise()).toBe(true);
+        apply = result.current.commands.apply();
+    });
+    await waitFor(() => expect(prepared().document.recipe).toEqual(FIRST_RUN_EXERCISE_RECIPE));
+    await acknowledge();
+    expect(await apply).toBe(true);
+    expect(result.current.dirty).toBe(false);
+    expect(result.current.isFirstExercise).toBe(true);
+});
+
+it('preserves a dirty draft and skips an in-flight config change when opening the first exercise', () => {
+    const original = prepared();
+    const { result } = renderHook(useRecipeDraft);
+    act(() => {
+        result.current.commands.number('data.noise', '12');
+        expect(result.current.commands.firstExercise()).toBe(false);
+    });
+    expect(result.current.value('data.noise')).toBe('12');
+
+    act(() => {
+        result.current.commands.cancel();
+        useTrainingStore.getState().beginConfigChange('setup');
+        expect(result.current.commands.firstExercise()).toBe(false);
+    });
+    expect(result.current.dirty).toBe(false);
+    expect(prepared()).toBe(original);
 });

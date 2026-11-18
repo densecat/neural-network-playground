@@ -84,6 +84,7 @@ export {
     DEFAULT_TRAINING,
     DEFAULT_DATA,
     DEFAULT_EXPERIMENT_DOCUMENT,
+    FIRST_RUN_EXERCISE_RECIPE,
 } from './constants.js';
 export {
     PAUSE_REASONS,

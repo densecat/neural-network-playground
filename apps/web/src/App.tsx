@@ -10,7 +10,7 @@ import { useThemeEffect } from './store/theme.ts';
 import { useSaveCurrentRun } from './hooks/useSaveCurrentRun.ts';
 import { useTraining } from './hooks/useTraining.ts';
 import { useAtelierViewport } from './hooks/useAtelierViewport.ts';
-import { useRecipeDraft } from './hooks/useRecipeDraft.ts';
+import { FIRST_RUN_EXERCISE, useRecipeDraft } from './hooks/useRecipeDraft.ts';
 import { useExperimentMemoryStorageSync } from './hooks/useExperimentMemoryStorageSync.ts';
 import { useNetworkSelectionModel, useNetworkSelectionState, type NetworkSelectionState } from './components/visualization/useNetworkSelectionController.ts';
 import { useDecisionBoundaryController, useDecisionOverlayPreference, type DecisionOverlayPreference } from './components/visualization/useDecisionBoundaryController.ts';
@@ -20,7 +20,7 @@ import { AtelierPrediction, DatasetPlotStatus, selectDatasetPlotStatus } from '.
 import { AtelierTransport, EvidenceMetrics, getTrainingUnavailableReason } from './components/atelier/AtelierTransport.tsx';
 import { SetupEditor } from './components/atelier/setup/SetupEditor.tsx';
 import { CheckpointPanel } from './components/atelier/CheckpointPanel.tsx';
-import { Dialog, Tabs } from './components/atelier/ui.tsx';
+import { Dialog, TabPanels, Tabs } from './components/atelier/ui.tsx';
 import { AccessibilityAnnouncer } from './components/layout/AccessibilityAnnouncer.tsx';
 import { CompatibilityState } from './components/common/CompatibilityState.tsx';
 import { ErrorBoundary } from './components/common/ErrorBoundary.tsx';
@@ -52,6 +52,8 @@ const LossChart = lazyView(() => import('./components/ResultsContent.ts').then((
 const ConfusionMatrix = lazyView(() => import('./components/ResultsContent.ts').then((module) => module.ConfusionMatrix));
 const WORKSPACE_TABS: { id: WorkspaceTab; label: string }[] = [{ id:'setup',label:'Setup' },{ id:'network',label:'Network' },{ id:'results',label:'Results' },{ id:'inspect',label:'Inspect' }];
 const RESULTS_TABS: { id: ResultsTab; label: string }[] = [{ id:'boundary',label:'Prediction' },{ id:'learning',label:'Learning progress' },{ id:'errors',label:'Errors & confusion' }];
+const REGRESSION_RESULTS_TABS = RESULTS_TABS.filter(({ id }) => id !== 'errors');
+const EXPORT_TABS = [{ id: 'setup', label: 'Setup & sharing' }, { id: 'code', label: 'Code' }] as const;
 const loading = <p role="status">Loading workspace…</p>;
 const canRetryView = (error: Error) => !(error instanceof ViewLoadError);
 
@@ -101,6 +103,7 @@ function AtelierShell() {
     const configError = useTrainingStore((s) => s.configError);
     const workerError = useTrainingStore((s) => s.workerError);
     const task = usePlaygroundStore((s) => s.access.status === 'ready' ? s.access.prepared.document.recipe.task : null);
+    const preparing = usePlaygroundStore((s) => s.preparation.status === 'preparing');
     const urlSyncNotice = usePlaygroundStore((s) => s.urlSyncNotice);
     const [utility, setUtility] = useState<UtilitySurface>(null);
     const [pendingNavigation, setPendingNavigation] = useState<(() => void) | null>(null);
@@ -111,6 +114,13 @@ function AtelierShell() {
     const [exportTab, setExportTab] = useState<'setup' | 'code'>('setup');
     const exportRequest = useLayoutStore((state) => state.exportRequest);
     const backgroundRef = useRef<HTMLDivElement>(null);
+    const focusExercise = useRef(false);
+    const focusExerciseHeading = useCallback((heading: HTMLHeadingElement | null) => {
+        if (heading && focusExercise.current) {
+            focusExercise.current = false;
+            heading.focus();
+        }
+    }, []);
     const draftRef = useRef(draft);
     draftRef.current = draft;
     const trainingRef = useRef(training);
@@ -134,6 +144,12 @@ function AtelierShell() {
         if (destination === 'playground' && workspaceTab === 'setup') requestGuardedNavigation(action); else action();
     };
     const openSetup = useCallback((tab: SetupTab) => { setUtility(null); useLayoutStore.getState().openSetup(tab); }, []);
+    const startExercise = () => {
+        if (draft.commands.firstExercise()) {
+            focusExercise.current = true;
+            openSetup('dataset');
+        }
+    };
     const tryVariation = useCallback((record: ExperimentRunRecordV2) => {
         requestGuardedNavigation(() => {
             if (draftRef.current.commands.variation(record)) openSetup('training');
@@ -152,6 +168,7 @@ function AtelierShell() {
     useEffect(() => { if (destination === 'saved-runs') setSavedVisited(true); if (destination === 'lessons') setLessonsVisited(true); }, [destination]);
 
     const regression = task?.kind === 'regression';
+    const resultTabs = regression ? REGRESSION_RESULTS_TABS : RESULTS_TABS;
     const effectiveResultsTab = regression && resultsTab === 'errors' ? 'boundary' : resultsTab;
     const stackedGraph = viewport.width < 1200 || activeLessonId !== null;
     const networkLayout = viewport.compact ? 'compact' : stackedGraph ? 'stacked' : 'wide';
@@ -212,10 +229,22 @@ function AtelierShell() {
             <div className="atelier-workspace-layout">
             {destination === 'playground' && <div className="atelier-workspace">
                 <Tabs panelPrefix="workspace" label="Experiment workspace" items={WORKSPACE_TABS} value={workspaceTab} onChange={(tab) => navigate('playground',tab)} />
-                {workspaceTab === 'network' && recordsReady && !hasRecords && !cueDismissed && !hasStartedLesson && !activeLessonId && <aside className="atelier-notice atelier-invitation" aria-label="Getting started"><p>Start small. Follow a guided experiment.</p><button type="button" onClick={() => navigate('lessons')}>Explore lessons</button><button type="button" aria-label="Dismiss lesson suggestion" onClick={() => useLayoutStore.getState().dismissLessonCue()}>Not now</button></aside>}
-                <div className="atelier-tab-content" role="tabpanel" id={`workspace-${workspaceTab}`} aria-labelledby={`workspace-tab-${workspaceTab}`}>
-                    <ErrorBoundary key={workspaceTab} title="Workspace unavailable" description="This view could not render. Your experiment remains available in the other views.">
-                    {workspaceTab === 'setup' && <SetupEditor controller={draft} tab={setupTab} onTabChange={(tab) => useLayoutStore.getState().setSetupTab(tab)} />}
+                {workspaceTab === 'network' && recordsReady && !hasRecords && !cueDismissed && !hasStartedLesson && !activeLessonId && <aside className="atelier-notice atelier-invitation" aria-label="Getting started">
+                    <p>Start small. Follow a guided experiment.</p>
+                    {!draft.isFirstExercise && <button type="button" onClick={startExercise} disabled={preparing || draft.busy || draft.dirty || !draft.recipe}>{FIRST_RUN_EXERCISE.title}</button>}
+                    <button type="button" onClick={() => navigate('lessons')}>Explore lessons</button>
+                    <button type="button" aria-label="Dismiss lesson suggestion" onClick={() => useLayoutStore.getState().dismissLessonCue()}>Not now</button>
+                </aside>}
+                <TabPanels panelPrefix="workspace" items={WORKSPACE_TABS} value={workspaceTab} className="atelier-tab-content">
+                    <ErrorBoundary title="Workspace unavailable" description="This view could not render. Your experiment remains available in the other views.">
+                    {workspaceTab === 'setup' && <>
+                        {draft.isFirstExercise && <section className="atelier-section" aria-labelledby="first-exercise-title">
+                            <h2 id="first-exercise-title" ref={focusExerciseHeading} tabIndex={-1}>{FIRST_RUN_EXERCISE.title}</h2>
+                            {draft.dirty && <p>Choose Apply changes to start this exercise, or Cancel to keep your current setup.</p>}
+                            <p>{FIRST_RUN_EXERCISE.instructions}</p>
+                        </section>}
+                        <SetupEditor controller={draft} tab={setupTab} onTabChange={(tab) => useLayoutStore.getState().setSetupTab(tab)} />
+                    </>}
                     {workspaceTab === 'network' && <>
                         <NetworkWorkspace
                             layout={networkLayout}
@@ -233,37 +262,40 @@ function AtelierShell() {
                     </>}
                     {workspaceTab === 'results' && <section className="atelier-evidence">
                         <Tabs
+                            panelPrefix="results"
                             label="Results views"
-                            items={regression ? RESULTS_TABS.filter((tab) => tab.id !== 'errors') : RESULTS_TABS}
+                            items={resultTabs}
                             value={effectiveResultsTab}
                             onChange={(tab) => {
                                 if (tab === 'errors') overlay.setOverlayMode('misclassification');
                                 useLayoutStore.getState().setResultsTab(tab);
                             }}
                         />
-                        {effectiveResultsTab === 'boundary' && <>
-                            <OptionalView title="Prediction unavailable">
-                                <div className="atelier-results-boundary"><PredictionWorkspace overlay={overlay} details /></div>
-                            </OptionalView>
-                            <EvidenceMetrics />
-                        </>}
-                        {effectiveResultsTab === 'learning' && <>
-                            <OptionalView title="Learning chart unavailable"><LossChart /></OptionalView>
-                            <EvidenceMetrics />
-                            <OptionalView title="Training explanation unavailable"><TrainingExplanationPanel /></OptionalView>
-                            <CurrentRunCard />
-                        </>}
-                        {effectiveResultsTab === 'errors' && <div className="atelier-results-errors">
-                            <div className="atelier-error-map">
-                                <h2>Prediction field</h2>
-                                <OptionalView title="Prediction unavailable"><PredictionWorkspace overlay={overlay} details /></OptionalView>
-                            </div>
-                            <OptionalView title="Confusion matrix unavailable"><ConfusionMatrix /></OptionalView>
-                        </div>}
+                        <TabPanels panelPrefix="results" items={resultTabs} value={effectiveResultsTab} tabIndex={0}>
+                            {effectiveResultsTab === 'boundary' && <>
+                                <OptionalView title="Prediction unavailable">
+                                    <div className="atelier-results-boundary"><PredictionWorkspace overlay={overlay} details /></div>
+                                </OptionalView>
+                                <EvidenceMetrics />
+                            </>}
+                            {effectiveResultsTab === 'learning' && <>
+                                <OptionalView title="Learning chart unavailable"><LossChart /></OptionalView>
+                                <EvidenceMetrics />
+                                <OptionalView title="Training explanation unavailable"><TrainingExplanationPanel /></OptionalView>
+                                <CurrentRunCard />
+                            </>}
+                            {effectiveResultsTab === 'errors' && <div className="atelier-results-errors">
+                                <div className="atelier-error-map">
+                                    <h2>Prediction field</h2>
+                                    <OptionalView title="Prediction unavailable"><PredictionWorkspace overlay={overlay} details /></OptionalView>
+                                </div>
+                                <OptionalView title="Confusion matrix unavailable"><ConfusionMatrix /></OptionalView>
+                            </div>}
+                        </TabPanels>
                     </section>}
                     {workspaceTab === 'inspect' && <section className="atelier-evidence"><OptionalView title="Workspace unavailable"><InspectionPanel onPause={training.pause} /></OptionalView></section>}
                     </ErrorBoundary>
-                </div>
+                </TabPanels>
             </div>}
             {(savedVisited || destination === 'saved-runs') && <div hidden={destination !== 'saved-runs'}><OptionalView title="Saved runs unavailable"><RunHistoryPanel saveController={saveController} saveFocusRequest={saveFocusRequest} onTryVariation={tryVariation} variationDisabled={draft.busy} /></OptionalView></div>}
             {(lessonsVisited || destination === 'lessons') && <div className="atelier-lesson-host" hidden={destination !== 'lessons' && !activeLessonId}><OptionalView title="Lessons unavailable"><GuidedLessonPanel onNavigate={requestGuardedNavigation} onReset={stableReset} onHighlightChange={setLessonHighlight} /></OptionalView></div>}
@@ -272,7 +304,12 @@ function AtelierShell() {
         <footer className="atelier-footer"><span>NN·FORGE · Experiments stay in your browser</span><span>Data → network → prediction</span></footer>
         {!workerError && !pendingNavigation && utility && <Dialog title={utility === 'exports' ? 'Export / import' : utility === 'checkpoints' ? 'Session checkpoints' : utility === 'preferences' ? 'Guidance' : 'Shortcuts & help'} onClose={() => setUtility(null)}>
             {utility === 'checkpoints' && <OptionalView title="Checkpoints unavailable"><CheckpointPanel training={training} /></OptionalView>}
-            {utility === 'exports' && <><Tabs<'setup' | 'code'> label="Export type" items={[{id:'setup',label:'Setup & sharing'},{id:'code',label:'Code'}]} value={exportTab} onChange={setExportTab} /><OptionalView key={exportTab} title="Export view unavailable">{exportTab === 'setup' ? <ConfigPanel onReset={stableReset} /> : <CodeExportPanel />}</OptionalView></>}
+            {utility === 'exports' && <>
+                <Tabs<'setup' | 'code'> panelPrefix="export" label="Export type" items={EXPORT_TABS} value={exportTab} onChange={setExportTab} />
+                <TabPanels panelPrefix="export" items={EXPORT_TABS} value={exportTab} tabIndex={0}>
+                    <OptionalView title="Export view unavailable">{exportTab === 'setup' ? <ConfigPanel onReset={stableReset} /> : <CodeExportPanel />}</OptionalView>
+                </TabPanels>
+            </>}
             {utility === 'preferences' && <><p>Choose how much explanation appears alongside the controls. Every feature remains available.</p><label htmlFor="atelier-guidance">Explanation density</label><select id="atelier-guidance" value={audienceMode} onChange={(event) => useLayoutStore.getState().setAudienceMode(event.target.value as 'beginner'|'explore'|'lab')}><option value="beginner">More</option><option value="explore">Standard</option><option value="lab">Compact</option></select></>}
             {utility === 'help' && <div className="atelier-help"><p>Build a dataset and network in Setup, apply the recipe, then train and inspect the results. Training continues when you change views.</p><dl>{TRAINING_SHORTCUTS.map((shortcut) => <div key={shortcut.code}><dt><kbd>{shortcut.label}</kbd></dt><dd>{shortcut.description}</dd></div>)}</dl><p>Shortcuts are inactive while editing fields or using a menu or dialog. Step is available while paused.</p><p>Saved runs hold evaluated evidence. Applying a saved recipe starts a fresh model; session checkpoints restore parameters and optimizer state. Eligible checkpoints can branch into a new run with seeded replay.</p><OptionalView title="Concept library unavailable"><ConceptLibrary /></OptionalView></div>}
         </Dialog>}
