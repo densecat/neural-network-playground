@@ -95,6 +95,7 @@ function assertCategoricalLogitsAndTarget(
         }
         targetSum += target[i];
     }
+    assertFinite(targetSum, 'target.sum');
     if (Math.abs(targetSum - 1) > DISTRIBUTION_SUM_TOLERANCE) {
         throw new RangeError('target values must sum to 1');
     }

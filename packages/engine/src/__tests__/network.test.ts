@@ -468,6 +468,20 @@ describe('Network private multiclass softmax foundation', () => {
         expect(metrics.confusionMatrix).toBeUndefined();
     });
 
+    it.each([1e300, -1e300])('retains categorical loss at equal logits of %s', (offset) => {
+        const net = new Network(makeSoftmaxConfig({ weightInit: 'zeros' }));
+        for (let neuron = 0; neuron < 3; neuron++) net.setBias(0, neuron, offset);
+
+        const metrics = net.evaluate(
+            [[0, 0], [1, 1]],
+            [[1, 0, 0], [0.2, 0.3, 0.5]],
+            'categoricalCrossEntropy',
+            'classification',
+        );
+
+        expect(metrics.loss).toBeCloseTo(Math.log(3), 12);
+    });
+
     it('returns a bounded 3x3 multiclass confusion matrix distinct from the binary field', () => {
         const net = new Network(makeSoftmaxConfig({ inputSize: 1 }));
         vi.spyOn(net, 'forward').mockImplementation((input: number[]) => {
@@ -552,6 +566,18 @@ describe('Network private multiclass softmax foundation', () => {
             'categoricalCrossEntropy' as unknown as TrainingConfig['lossType'],
             'classification',
         )).toThrow(RangeError);
+    });
+
+    it('reports a non-finite categorical target sum', () => {
+        const net = new Network(makeSoftmaxConfig({ weightInit: 'zeros' }));
+        const error = captureNonFinite(() => net.evaluate(
+            [[0, 0]],
+            [[Number.MAX_VALUE, Number.MAX_VALUE, 0]],
+            'categoricalCrossEntropy',
+            'classification',
+        ));
+
+        expect(error).toMatchObject({ path: 'target.sum', value: Infinity });
     });
 
     it('rejects softmax output with non-categorical losses', () => {
